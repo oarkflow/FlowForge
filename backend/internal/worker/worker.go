@@ -194,11 +194,6 @@ func (p *Pool) metricsCollectorTask(ctx context.Context) error {
 	p.db.GetContext(ctx, &onlineAgents,
 		"SELECT COUNT(*) FROM agents WHERE status IN ('online', 'busy')")
 
-	log.Debug().
-		Int("active_runs", activeRuns).
-		Int("online_agents", onlineAgents).
-		Msg("system metrics collected")
-
 	return nil
 }
 

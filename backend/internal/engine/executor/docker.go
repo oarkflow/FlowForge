@@ -204,6 +204,7 @@ func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, step ExecutionStep
 // dockerContainerConfig represents the Docker container creation request.
 type dockerContainerConfig struct {
 	Image        string           `json:"Image"`
+	Entrypoint   []string         `json:"Entrypoint"`
 	Cmd          []string         `json:"Cmd"`
 	Env          []string         `json:"Env,omitempty"`
 	WorkingDir   string           `json:"WorkingDir,omitempty"`
@@ -235,7 +236,8 @@ func (e *DockerExecutor) buildContainerConfig(step ExecutionStep, image string) 
 
 	config := dockerContainerConfig{
 		Image:        image,
-		Cmd:          []string{"sh", "-c", step.Command},
+		Entrypoint:   []string{"/bin/sh"},
+		Cmd:          []string{"-c", step.Command},
 		Env:          envList,
 		WorkingDir:   "/workspace",
 		AttachStdout: true,

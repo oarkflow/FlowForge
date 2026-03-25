@@ -105,6 +105,14 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	secrets.Put("/:secretId", middleware.RequireAdmin(), h.UpdateSecret)
 	secrets.Delete("/:secretId", middleware.RequireAdmin(), h.DeleteSecret)
 
+	// Environment Variables
+	envVars := projects.Group("/:id/env-vars")
+	envVars.Get("/", middleware.RequireDev(), h.ListEnvVars)
+	envVars.Post("/", middleware.RequireDev(), h.CreateEnvVar)
+	envVars.Put("/", middleware.RequireDev(), h.BulkSaveEnvVars) // Bulk upsert
+	envVars.Put("/:varId", middleware.RequireDev(), h.UpdateEnvVar)
+	envVars.Delete("/:varId", middleware.RequireDev(), h.DeleteEnvVar)
+
 	// Notifications
 	notifs := projects.Group("/:id/notifications")
 	notifs.Get("/", h.ListNotificationChannels)

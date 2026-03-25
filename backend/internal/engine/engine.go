@@ -218,6 +218,7 @@ func (e *Engine) buildPipelineConfig(ctx context.Context, p *models.Pipeline, tr
 	// 1. Try direct JSON unmarshal into scheduler.PipelineConfig (for configs stored as scheduler JSON)
 	var direct scheduler.PipelineConfig
 	if err := json.Unmarshal([]byte(content), &direct); err == nil && len(direct.Stages) > 0 {
+		e.injectProjectEnv(ctx, p, &direct)
 		e.injectRepoEnv(ctx, p, triggerData, &direct)
 		return direct
 	}
@@ -230,8 +231,58 @@ func (e *Engine) buildPipelineConfig(ctx context.Context, p *models.Pipeline, tr
 	}
 
 	config := specToSchedulerConfig(spec)
+	e.injectProjectEnv(ctx, p, &config)
 	e.injectRepoEnv(ctx, p, triggerData, &config)
 	return config
+}
+
+// injectProjectEnv fetches project-level environment variables and secrets,
+// then injects them into every step's env map. These are set before YAML-level
+// env vars, so pipeline/job/step env definitions can override them.
+func (e *Engine) injectProjectEnv(ctx context.Context, p *models.Pipeline, config *scheduler.PipelineConfig) {
+	// 1. Fetch project env vars (plaintext key-value pairs)
+	envVars, err := e.repos.EnvVars.GetForInjection(ctx, p.ProjectID)
+	if err != nil {
+		log.Warn().Err(err).Str("project_id", p.ProjectID).Msg("engine: failed to fetch project env vars")
+	}
+
+	// 2. Fetch project secrets (encrypted, decrypted at runtime)
+	secretVars, err := e.repos.Secrets.ListByProject(ctx, p.ProjectID, 10000, 0)
+	if err != nil {
+		log.Warn().Err(err).Str("project_id", p.ProjectID).Msg("engine: failed to fetch project secrets")
+	}
+
+	if len(envVars) == 0 && len(secretVars) == 0 {
+		return
+	}
+
+	// Inject into every step — env vars first, then any secret keys that
+	// aren't already overridden by explicit env vars or pipeline config.
+	for i := range config.Stages {
+		for j := range config.Stages[i].Jobs {
+			for k := range config.Stages[i].Jobs[j].Steps {
+				if config.Stages[i].Jobs[j].Steps[k].Env == nil {
+					config.Stages[i].Jobs[j].Steps[k].Env = make(map[string]string)
+				}
+				env := config.Stages[i].Jobs[j].Steps[k].Env
+
+				// Project env vars (lowest priority — can be overridden by pipeline YAML env)
+				for key, val := range envVars {
+					if _, exists := env[key]; !exists {
+						env[key] = val
+					}
+				}
+
+				// Secrets are decrypted and injected by name. They are also
+				// lowest priority so pipeline YAML can override if needed.
+				// Note: The encrypted value from DB is not useful here. We
+				// need the SecretStore for decryption. For now, we only inject
+				// plaintext env vars. Secrets injection requires the
+				// SecretStore which lives in the handler layer. We'll add
+				// secret injection when the SecretStore is wired into the engine.
+			}
+		}
+	}
 }
 
 // injectRepoEnv looks up the repository associated with a pipeline and injects
@@ -303,21 +354,18 @@ DEPTH="${INPUT_DEPTH:-1}"
 FILE_COUNT=$(ls -1A /workspace 2>/dev/null | wc -l)
 if [ "$FILE_COUNT" -gt 0 ]; then
   echo "Workspace already has $FILE_COUNT entries — skipping checkout"
-  ls -la
   exit 0
 fi
 
 if [ -z "$REPO_URL" ]; then
   echo "Checkout: No repository URL configured — skipping"
-  echo "Working directory: $(pwd)"
-  ls -la 2>/dev/null || true
+  exit 0
   exit 0
 fi
 
 # Helper: copy all files (including hidden) from $1 into current directory
 copy_source() {
   SRC="$1"
-  echo "Copying files from $SRC to $(pwd) ..."
   # Use find + cp to reliably copy all files including hidden ones
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "$SRC/" ./
@@ -325,8 +373,6 @@ copy_source() {
     # tar pipe is the most reliable cross-platform approach
     (cd "$SRC" && tar cf - .) | tar xf -
   fi
-  COUNT=$(ls -1A | wc -l)
-  echo "Copied $COUNT entries to workspace"
 }
 
 # Determine if this is a local path or remote URL
@@ -341,12 +387,7 @@ if [ "$IS_LOCAL" = "true" ]; then
   if [ ! -e "$LOCAL_PATH" ]; then
     # Inside a container, local paths are mounted at /mnt/source
     if [ -e "/mnt/source" ]; then
-      echo "Using bind-mounted source from /mnt/source"
-      echo "Source contents:"
-      ls -la /mnt/source/ | head -20
       copy_source /mnt/source
-      echo "Workspace after copy:"
-      ls -la
       exit 0
     fi
     echo "Warning: Local path '$LOCAL_PATH' not found — skipping checkout"
@@ -374,7 +415,6 @@ if [ "$IS_LOCAL" = "true" ]; then
     copy_source "$LOCAL_PATH"
   fi
   echo "Source files ready in workspace"
-  ls -la
 else
   # Remote URL — use git clone
   echo "Cloning $REPO_URL (branch: $BRANCH, depth: $DEPTH)"
@@ -391,7 +431,6 @@ else
     git clone --depth="$DEPTH" --branch "$BRANCH" --single-branch "$REPO_URL" .
   fi
   echo "Checked out $(git rev-parse --short HEAD 2>/dev/null || echo 'N/A') on $BRANCH"
-  ls -la
 fi`
 
 	case "upload-artifact":

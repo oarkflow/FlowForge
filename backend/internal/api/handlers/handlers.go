@@ -2138,6 +2138,114 @@ func (h *Handler) BitbucketWebhook(c fiber.Ctx) error {
 }
 
 // =========================================================================
+// ENVIRONMENT VARIABLES
+// =========================================================================
+
+// ListEnvVars returns all environment variables for a project.
+func (h *Handler) ListEnvVars(c fiber.Ctx) error {
+	projectID := c.Params("id")
+	vars, err := h.repo.EnvVars.ListByProject(c.Context(), projectID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to list environment variables")
+	}
+	return c.JSON(vars)
+}
+
+// CreateEnvVar creates a new environment variable for a project.
+func (h *Handler) CreateEnvVar(c fiber.Ctx) error {
+	projectID := c.Params("id")
+	var input struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := c.Bind().JSON(&input); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
+	}
+	if input.Key == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "key is required")
+	}
+
+	ev := &models.EnvVar{
+		ProjectID: projectID,
+		Key:       input.Key,
+		Value:     input.Value,
+	}
+	if err := h.repo.EnvVars.Create(c.Context(), ev); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			return fiber.NewError(fiber.StatusConflict, "environment variable with this key already exists")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to create environment variable")
+	}
+	return c.Status(fiber.StatusCreated).JSON(ev)
+}
+
+// UpdateEnvVar updates an existing environment variable.
+func (h *Handler) UpdateEnvVar(c fiber.Ctx) error {
+	varID := c.Params("varId")
+	var input struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := c.Bind().JSON(&input); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
+	}
+
+	ev := &models.EnvVar{
+		ID:    varID,
+		Key:   input.Key,
+		Value: input.Value,
+	}
+	if err := h.repo.EnvVars.Update(c.Context(), ev); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to update environment variable")
+	}
+	return c.JSON(ev)
+}
+
+// DeleteEnvVar deletes an environment variable.
+func (h *Handler) DeleteEnvVar(c fiber.Ctx) error {
+	varID := c.Params("varId")
+	if err := h.repo.EnvVars.Delete(c.Context(), varID); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to delete environment variable")
+	}
+	return c.JSON(fiber.Map{"message": "environment variable deleted"})
+}
+
+// BulkSaveEnvVars replaces all environment variables for a project.
+func (h *Handler) BulkSaveEnvVars(c fiber.Ctx) error {
+	projectID := c.Params("id")
+	var input []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := c.Bind().JSON(&input); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request body — expected array of {key, value}")
+	}
+
+	var vars []models.EnvVar
+	for _, item := range input {
+		if item.Key == "" {
+			continue
+		}
+		vars = append(vars, models.EnvVar{
+			ProjectID: projectID,
+			Key:       item.Key,
+			Value:     item.Value,
+		})
+	}
+
+	if err := h.repo.EnvVars.BulkSave(c.Context(), projectID, vars); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to save environment variables")
+	}
+
+	// Return the saved vars
+	saved, err := h.repo.EnvVars.ListByProject(c.Context(), projectID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "saved but failed to reload")
+	}
+	return c.JSON(saved)
+}
+
+// =========================================================================
 // HELPER FUNCTIONS
 // =========================================================================
 

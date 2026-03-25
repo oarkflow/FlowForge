@@ -15,6 +15,7 @@ type Repositories struct {
 	Artifacts     *ArtifactRepo
 	Notifications *NotificationRepo
 	AuditLogs     *AuditLogRepo
+	EnvVars       *EnvVarRepo
 }
 
 func NewRepositories(db *sqlx.DB) *Repositories {
@@ -31,5 +32,6 @@ func NewRepositories(db *sqlx.DB) *Repositories {
 		Artifacts:     &ArtifactRepo{db: db},
 		Notifications: &NotificationRepo{db: db},
 		AuditLogs:     &AuditLogRepo{db: db},
+		EnvVars:       NewEnvVarRepo(db),
 	}
 }

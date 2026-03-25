@@ -1,7 +1,7 @@
 import type {
   ApiError, AuthTokens, User, Organization, OrgMember, Project, Repository,
   Pipeline, PipelineVersion, PipelineRun, RunWithMeta, StageRun, JobRun, StepRun,
-  Secret, Agent, Artifact, NotificationChannel, AuditLog, LogLine,
+  Secret, EnvVar, Agent, Artifact, NotificationChannel, AuditLog, LogLine,
   PaginatedResponse, SystemHealth, LoginRequest, RegisterRequest,
   ProviderRepo, ImportDetectRequest, ImportDetectResponse,
   ImportCreateProjectRequest, ImportCreateProjectResponse,
@@ -310,6 +310,18 @@ export const api = {
       apiClient.put<Secret>(`/projects/${projectId}/secrets/${secretId}`, { value }),
     delete: (projectId: string, secretId: string) =>
       apiClient.delete<void>(`/projects/${projectId}/secrets/${secretId}`),
+  },
+
+  envVars: {
+    list: (projectId: string) => apiClient.get<EnvVar[]>(`/projects/${projectId}/env-vars`),
+    create: (projectId: string, key: string, value: string) =>
+      apiClient.post<EnvVar>(`/projects/${projectId}/env-vars`, { key, value }),
+    update: (projectId: string, varId: string, key: string, value: string) =>
+      apiClient.put<EnvVar>(`/projects/${projectId}/env-vars/${varId}`, { key, value }),
+    delete: (projectId: string, varId: string) =>
+      apiClient.delete<void>(`/projects/${projectId}/env-vars/${varId}`),
+    bulkSave: (projectId: string, vars: { key: string; value: string }[]) =>
+      apiClient.put<EnvVar[]>(`/projects/${projectId}/env-vars`, vars),
   },
 
   agents: {

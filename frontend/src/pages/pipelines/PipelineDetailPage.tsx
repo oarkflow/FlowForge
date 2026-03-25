@@ -52,6 +52,11 @@ const PipelineDetailPage: Component = () => {
   const [deleting, setDeleting] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
 
+  // Config editing
+  const [editingConfig, setEditingConfig] = createSignal(false);
+  const [configContent, setConfigContent] = createSignal('');
+  const [savingConfig, setSavingConfig] = createSignal(false);
+
   // Settings form
   const [editName, setEditName] = createSignal('');
   const [editDesc, setEditDesc] = createSignal('');
@@ -191,6 +196,59 @@ const PipelineDetailPage: Component = () => {
     }
   };
 
+  const startEditingConfig = () => {
+    setConfigContent(pipeline()?.config_content ?? '');
+    setEditingConfig(true);
+  };
+
+  const cancelEditingConfig = () => {
+    setEditingConfig(false);
+    setConfigContent('');
+  };
+
+  const handleSaveConfig = async () => {
+    setSavingConfig(true);
+    try {
+      await api.pipelines.update(params.id, params.pid, {
+        config_content: configContent(),
+      });
+      toast.success('Pipeline configuration saved');
+      setEditingConfig(false);
+      refetch();
+    } catch (err) {
+      const msg = err instanceof ApiRequestError ? err.message : 'Failed to save configuration';
+      toast.error(msg);
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
+  const insertConfigSnippet = (snippet: string) => {
+    const current = configContent();
+    const hasContent = current.trim().length > 0;
+    setConfigContent(hasContent ? current + '\n' + snippet : snippet);
+  };
+
+  const makefileSnippet = `  makefile-build:
+    stage: build
+    steps:
+      - name: Run make
+        run: make build`;
+
+  const bashScriptSnippet = `  run-script:
+    stage: build
+    steps:
+      - name: Run bash script
+        run: bash scripts/build.sh`;
+
+  const configFileSnippet = `  inject-config:
+    stage: setup
+    steps:
+      - name: Inject config
+        run: |
+          cp config/app.env .env
+          source .env`;
+
   // Extract triggers from pipeline config
   const triggers = () => pipeline()?.triggers ?? {};
   const pushTrigger = () => triggers().push as Record<string, unknown> | undefined;
@@ -251,22 +309,74 @@ const PipelineDetailPage: Component = () => {
         <div class="h-96 bg-[var(--color-bg-secondary)] rounded-xl animate-pulse" />
       }>
         <Switch>
-          {/* ---- Configuration (YAML Viewer) ---- */}
+          {/* ---- Configuration (YAML Viewer / Editor) ---- */}
           <Match when={activeTab() === 'configuration'}>
             <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
               <div class="lg:col-span-3">
-                <Card title="Pipeline Configuration" description={`Version ${pipeline()?.config_version ?? '-'} · Source: ${pipeline()?.config_source === 'repo' ? pipeline()?.config_path : 'Database'}`}>
-                  <Show when={pipeline()?.config_content} fallback={
-                    <div class="text-center py-8 text-[var(--color-text-tertiary)]">
-                      <p class="text-sm">No configuration content available.</p>
-                      <p class="text-xs mt-1">
-                        {pipeline()?.config_source === 'repo' ? 'Configuration is read from the repository.' : 'Edit the pipeline configuration below.'}
-                      </p>
-                    </div>
+                <Card title="Pipeline Configuration" description={`Version ${pipeline()?.config_version ?? '-'} · Source: ${pipeline()?.config_source === 'repo' ? pipeline()?.config_path : 'Database'}`}
+                  actions={
+                    <Show when={pipeline()?.config_source !== 'repo'}>
+                      <Show when={!editingConfig()} fallback={
+                        <div class="flex items-center gap-2">
+                          <Button size="sm" variant="ghost" onClick={cancelEditingConfig}>Cancel</Button>
+                          <Button size="sm" onClick={handleSaveConfig} loading={savingConfig()}>Save Configuration</Button>
+                        </div>
+                      }>
+                        <Button size="sm" variant="outline" onClick={startEditingConfig}>Edit</Button>
+                      </Show>
+                    </Show>
+                  }
+                >
+                  <Show when={editingConfig()} fallback={
+                    <Show when={pipeline()?.config_content} fallback={
+                      <div class="text-center py-8 text-[var(--color-text-tertiary)]">
+                        <p class="text-sm">No configuration content available.</p>
+                        <p class="text-xs mt-1">
+                          {pipeline()?.config_source === 'repo' ? 'Configuration is read from the repository.' : 'Click Edit to add pipeline configuration.'}
+                        </p>
+                      </div>
+                    }>
+                      <pre class="bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] rounded-lg p-4 overflow-auto max-h-[600px] text-sm font-mono leading-relaxed">
+                        <code class="text-[var(--color-text-secondary)]">{pipeline()!.config_content}</code>
+                      </pre>
+                    </Show>
                   }>
-                    <pre class="bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] rounded-lg p-4 overflow-auto max-h-[600px] text-sm font-mono leading-relaxed">
-                      <code class="text-[var(--color-text-secondary)]">{pipeline()!.config_content}</code>
-                    </pre>
+                    <div class="space-y-3">
+                      <textarea
+                        value={configContent()}
+                        onInput={(e) => setConfigContent(e.currentTarget.value)}
+                        class="w-full h-[500px] px-4 py-3 text-sm font-mono bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] rounded-lg text-[var(--color-text-primary)] placeholder-[var(--color-text-tertiary)] focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500/50 resize-y"
+                        placeholder="# FlowForge Pipeline Configuration (YAML)"
+                        spellcheck={false}
+                      />
+                      <div class="flex items-center gap-2 flex-wrap">
+                        <span class="text-xs text-[var(--color-text-tertiary)] mr-1">Quick add:</span>
+                        <button
+                          type="button"
+                          onClick={() => insertConfigSnippet(makefileSnippet)}
+                          class="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-[var(--color-text-secondary)] bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)] rounded-md hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] transition-colors"
+                        >
+                          <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4.5 2A1.5 1.5 0 003 3.5v13A1.5 1.5 0 004.5 18h11a1.5 1.5 0 001.5-1.5V7.621a1.5 1.5 0 00-.44-1.06l-4.12-4.122A1.5 1.5 0 0011.378 2H4.5z" clip-rule="evenodd" /></svg>
+                          Makefile Step
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => insertConfigSnippet(bashScriptSnippet)}
+                          class="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-[var(--color-text-secondary)] bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)] rounded-md hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] transition-colors"
+                        >
+                          <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3.25 3A2.25 2.25 0 001 5.25v9.5A2.25 2.25 0 003.25 17h13.5A2.25 2.25 0 0019 14.75v-9.5A2.25 2.25 0 0016.75 3H3.25zm.943 8.752a.75.75 0 01.055-1.06L6.128 9l-1.88-1.693a.75.75 0 111.004-1.114l2.5 2.25a.75.75 0 010 1.114l-2.5 2.25a.75.75 0 01-1.06-.055zM9.75 10.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z" clip-rule="evenodd" /></svg>
+                          Bash Script Step
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => insertConfigSnippet(configFileSnippet)}
+                          class="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-[var(--color-text-secondary)] bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)] rounded-md hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] transition-colors"
+                        >
+                          <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd" /></svg>
+                          Config File Step
+                        </button>
+                      </div>
+                    </div>
                   </Show>
                 </Card>
               </div>

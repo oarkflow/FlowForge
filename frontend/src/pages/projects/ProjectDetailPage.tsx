@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { createSignal, createResource, For, Show, Switch, Match } from 'solid-js';
+import { createSignal, createResource, createMemo, For, Show, Switch, Match } from 'solid-js';
 import { useParams, A, useNavigate } from '@solidjs/router';
 import PageContainer from '../../components/layout/PageContainer';
 import Card from '../../components/ui/Card';
@@ -10,9 +10,10 @@ import Modal from '../../components/ui/Modal';
 import Select from '../../components/ui/Select';
 import Tabs from '../../components/ui/Tabs';
 import Table, { type TableColumn } from '../../components/ui/Table';
+import KeyValueEditor, { type KeyValuePair } from '../../components/ui/KeyValueEditor';
 import { toast } from '../../components/ui/Toast';
 import { api, ApiRequestError } from '../../api/client';
-import type { Pipeline, PipelineRun, Repository, Secret, NotificationChannel, RunStatus } from '../../types';
+import type { Pipeline, PipelineRun, Repository, Secret, EnvVar, NotificationChannel, RunStatus } from '../../types';
 import { formatRelativeTime, formatDuration, getStatusBadgeVariant, truncateCommitSha } from '../../utils/helpers';
 
 const statusLabel: Record<RunStatus, string> = {
@@ -24,12 +25,13 @@ const statusLabel: Record<RunStatus, string> = {
 // Fetchers
 // ---------------------------------------------------------------------------
 async function fetchProject(id: string) {
-  const [project, pipelines, repos, secrets, notifications] = await Promise.all([
+  const [project, pipelines, repos, secrets, notifications, envVars] = await Promise.all([
     api.projects.get(id),
     api.pipelines.list(id).catch(() => [] as Pipeline[]),
     api.repositories.list(id).catch(() => [] as Repository[]),
     api.secrets.list(id).catch(() => [] as Secret[]),
     api.notifications.list(id).catch(() => [] as NotificationChannel[]),
+    api.envVars.list(id).catch(() => [] as EnvVar[]),
   ]);
 
   // Fetch recent runs across all pipelines
@@ -42,32 +44,8 @@ async function fetchProject(id: string) {
   }
   runs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
-  return { project, pipelines, repos, secrets, notifications, runs: runs.slice(0, 10) };
+  return { project, pipelines, repos, secrets, notifications, envVars, runs: runs.slice(0, 10) };
 }
-
-// Run table columns
-const runColumns: TableColumn<PipelineRun>[] = [
-  { key: 'number', header: '#', width: '70px', render: (row) => <span class="text-sm font-mono font-medium text-[var(--color-text-primary)]">#{row.number}</span> },
-  { key: 'status', header: 'Status', width: '140px', render: (row) => (
-    <div>
-      <Badge variant={getStatusBadgeVariant(row.status)} dot size="sm">{statusLabel[row.status]}</Badge>
-      {row.status === 'failure' && row.error_summary ? (
-        <p class="text-xs text-red-400/80 mt-1 truncate max-w-[200px]" title={row.error_summary}>{row.error_summary}</p>
-      ) : null}
-    </div>
-  )},
-  { key: 'commit', header: 'Commit', render: (row) => (
-    <div class="min-w-0">
-      <p class="text-sm text-[var(--color-text-primary)] truncate max-w-sm">{row.commit_message || '-'}</p>
-      <div class="flex items-center gap-2 mt-0.5">
-        <span class="text-xs font-mono text-[var(--color-text-tertiary)]">{truncateCommitSha(row.commit_sha)}</span>
-        <Show when={row.branch}><span class="text-xs text-[var(--color-text-tertiary)]">on {row.branch}</span></Show>
-      </div>
-    </div>
-  )},
-  { key: 'duration', header: 'Duration', width: '100px', align: 'right' as const, render: (row) => <span class="text-xs font-mono text-[var(--color-text-secondary)]">{formatDuration(row.duration_ms)}</span> },
-  { key: 'time', header: 'Started', width: '90px', align: 'right' as const, render: (row) => <span class="text-xs text-[var(--color-text-tertiary)]">{formatRelativeTime(row.created_at)}</span> },
-];
 
 // ---------------------------------------------------------------------------
 // Component
@@ -77,6 +55,66 @@ const ProjectDetailPage: Component = () => {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = createSignal('overview');
   const [data, { refetch }] = createResource(() => params.id, fetchProject);
+
+  // Run table columns (inside component for access to params.id)
+  const runColumns = createMemo((): TableColumn<PipelineRun>[] => [
+    { key: 'number', header: '#', width: '70px', render: (row) => (
+      <A href={`/projects/${params.id}/pipelines/${row.pipeline_id}/runs/${row.id}`}
+         class="text-sm font-mono font-medium text-indigo-400 hover:text-indigo-300">
+        #{row.number}
+      </A>
+    )},
+    { key: 'status', header: 'Status', width: '140px', render: (row) => (
+      <div>
+        <Badge variant={getStatusBadgeVariant(row.status)} dot size="sm">{statusLabel[row.status]}</Badge>
+        {row.status === 'failure' && row.error_summary ? (
+          <p class="text-xs text-red-400/80 mt-1 truncate max-w-[200px]" title={row.error_summary}>{row.error_summary}</p>
+        ) : null}
+      </div>
+    )},
+    { key: 'commit', header: 'Commit', render: (row) => (
+      <div class="min-w-0">
+        <p class="text-sm text-[var(--color-text-primary)] truncate max-w-sm">{row.commit_message || '-'}</p>
+        <div class="flex items-center gap-2 mt-0.5">
+          <span class="text-xs font-mono text-[var(--color-text-tertiary)]">{truncateCommitSha(row.commit_sha)}</span>
+          <Show when={row.branch}><span class="text-xs text-[var(--color-text-tertiary)]">on {row.branch}</span></Show>
+        </div>
+      </div>
+    )},
+    { key: 'duration', header: 'Duration', width: '100px', align: 'right' as const, render: (row) => <span class="text-xs font-mono text-[var(--color-text-secondary)]">{formatDuration(row.duration_ms)}</span> },
+    { key: 'time', header: 'Started', width: '90px', align: 'right' as const, render: (row) => <span class="text-xs text-[var(--color-text-tertiary)]">{formatRelativeTime(row.created_at)}</span> },
+  ]);
+
+  // Environment variables state
+  const [envVarItems, setEnvVarItems] = createSignal<KeyValuePair[]>([]);
+  const [savingEnvVars, setSavingEnvVars] = createSignal(false);
+  const [envVarsDirty, setEnvVarsDirty] = createSignal(false);
+
+  const initEnvVars = () => {
+    const vars = data()?.envVars ?? [];
+    setEnvVarItems(vars.map(v => ({ id: v.id, key: v.key, value: v.value })));
+    setEnvVarsDirty(false);
+  };
+
+  const handleEnvVarChange = (items: KeyValuePair[]) => {
+    setEnvVarItems(items);
+    setEnvVarsDirty(true);
+  };
+
+  const handleSaveEnvVars = async () => {
+    setSavingEnvVars(true);
+    try {
+      const vars = envVarItems().filter(v => v.key.trim());
+      await api.envVars.bulkSave(params.id, vars.map(v => ({ key: v.key, value: v.value })));
+      toast.success('Environment variables saved');
+      setEnvVarsDirty(false);
+      refetch();
+    } catch (err) {
+      toast.error(err instanceof ApiRequestError ? err.message : 'Failed to save environment variables');
+    } finally {
+      setSavingEnvVars(false);
+    }
+  };
 
   // Secret form
   const [showAddSecret, setShowAddSecret] = createSignal(false);
@@ -217,6 +255,7 @@ const ProjectDetailPage: Component = () => {
     { id: 'pipelines', label: `Pipelines (${data()?.pipelines?.length ?? 0})` },
     { id: 'runs', label: 'Runs' },
     { id: 'repositories', label: 'Repositories' },
+    { id: 'environment', label: `Environment (${data()?.envVars?.length ?? 0})` },
     { id: 'secrets', label: `Secrets (${data()?.secrets?.length ?? 0})` },
     { id: 'notifications', label: 'Notifications' },
     { id: 'settings', label: 'Settings' },
@@ -336,7 +375,7 @@ const ProjectDetailPage: Component = () => {
       <Show when={!data.loading && data()} fallback={
         <div class="space-y-4"><div class="h-10 bg-[var(--color-bg-secondary)] rounded animate-pulse" /><div class="h-64 bg-[var(--color-bg-secondary)] rounded-xl animate-pulse" /></div>
       }>
-        <Tabs tabs={tabs()} activeTab={activeTab()} onTabChange={(id) => { setActiveTab(id); if (id === 'settings') initSettings(); }} class="mb-6" />
+        <Tabs tabs={tabs()} activeTab={activeTab()} onTabChange={(id) => { setActiveTab(id); if (id === 'settings') initSettings(); if (id === 'environment') initEnvVars(); }} class="mb-6" />
 
         <Switch>
           {/* Overview */}
@@ -368,7 +407,8 @@ const ProjectDetailPage: Component = () => {
                   </Show>
                 </Card>
                 <Card title="Recent Runs" padding={false}>
-                  <Table columns={runColumns} data={data()?.runs ?? []} emptyMessage="No runs yet" />
+                  <Table columns={runColumns()} data={data()?.runs ?? []} emptyMessage="No runs yet"
+                    onRowClick={(row) => navigate(`/projects/${params.id}/pipelines/${row.pipeline_id}/runs/${row.id}`)} />
                 </Card>
               </div>
               <div class="space-y-6">
@@ -449,7 +489,8 @@ const ProjectDetailPage: Component = () => {
           {/* Runs */}
           <Match when={activeTab() === 'runs'}>
             <Card padding={false}>
-              <Table columns={runColumns} data={data()?.runs ?? []} emptyMessage="No pipeline runs yet" />
+              <Table columns={runColumns()} data={data()?.runs ?? []} emptyMessage="No pipeline runs yet"
+                onRowClick={(row) => navigate(`/projects/${params.id}/pipelines/${row.pipeline_id}/runs/${row.id}`)} />
             </Card>
           </Match>
 
@@ -496,6 +537,28 @@ const ProjectDetailPage: Component = () => {
                 </div>
               </Modal>
             </Show>
+          </Match>
+
+          {/* Environment Variables */}
+          <Match when={activeTab() === 'environment'}>
+            <Card title="Environment Variables" description="Non-secret key-value pairs available to all pipelines in this project. For sensitive values, use the Secrets tab instead.">
+              <KeyValueEditor
+                items={envVarItems()}
+                onChange={handleEnvVarChange}
+                keyPlaceholder="VARIABLE_NAME"
+                valuePlaceholder="value"
+              />
+              <Show when={envVarItems().length > 0 || envVarsDirty()}>
+                <div class="flex items-center justify-between mt-6 pt-4 border-t border-[var(--color-border-primary)]">
+                  <p class="text-xs text-[var(--color-text-tertiary)]">
+                    {envVarsDirty() ? 'You have unsaved changes.' : 'All changes saved.'}
+                  </p>
+                  <Button onClick={handleSaveEnvVars} loading={savingEnvVars()} disabled={!envVarsDirty()}>
+                    Save Environment Variables
+                  </Button>
+                </div>
+              </Show>
+            </Card>
           </Match>
 
           {/* Secrets */}

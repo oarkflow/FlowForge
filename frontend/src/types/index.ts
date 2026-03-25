@@ -215,6 +215,16 @@ export interface Secret {
   updated_at: string;
 }
 
+// --- Environment Variable ---
+export interface EnvVar {
+  id: string;
+  project_id: string;
+  key: string;
+  value: string;
+  created_at: string;
+  updated_at: string;
+}
+
 // --- Artifact ---
 export interface Artifact {
   id: string;

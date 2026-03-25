@@ -357,7 +357,8 @@ const RunDetailPage: Component = () => {
 
 	return (
 		<PageContainer
-			title={run() ? `Run #${run()!.number}` : 'Run Detail'}
+			title={run() ? `${pipelineName()} #${run()!.number}` : 'Run Detail'}
+			description={run() ? `${projectName()} · ${run()!.trigger_type.replace('_', ' ')} trigger` : undefined}
 			breadcrumbs={[
 				{ label: 'Projects', href: '/projects' },
 				{ label: projectName(), href: `/projects/${params.id}` },
@@ -426,12 +427,14 @@ const RunDetailPage: Component = () => {
 				{/* Run info bar */}
 				<Show when={run()}>
 					<div class="flex flex-wrap items-center gap-4 mb-6 p-4 bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border-primary)]">
-						<Show when={run()!.commit_message}>
-							<div class="flex items-center gap-2 text-sm">
+						<div class="flex items-center gap-2 text-sm">
+							<Show when={run()!.commit_message} fallback={
+								<span class="text-[var(--color-text-secondary)] italic">No commit message</span>
+							}>
 								<svg class="w-4 h-4 text-[var(--color-text-tertiary)]" viewBox="0 0 20 20" fill="currentColor"><path d="M3.505 2.365A41.369 41.369 0 019 2c1.863 0 3.697.124 5.495.365 1.247.167 2.18 1.108 2.435 2.268a4.45 4.45 0 00-.577-.069 43.141 43.141 0 00-4.706 0C9.229 4.696 7.5 6.727 7.5 8.998v2.24a23.269 23.269 0 01-1.943-.178l-2.46 2.46A.75.75 0 012 12.945V5.147a2.778 2.778 0 011.505-2.782z" /><path d="M10.647 4.563a41.612 41.612 0 00-4.294 0C5.025 4.68 4 5.865 4 7.222v6.195c0 .573.224 1.122.623 1.528l.119.116 2.36-2.36A22.288 22.288 0 009 12.998a22.288 22.288 0 003.898-.297l2.36 2.36.119-.116c.399-.406.623-.955.623-1.528V7.222c0-1.357-1.025-2.542-2.353-2.659z" /></svg>
 								<span class="text-[var(--color-text-secondary)]">{run()!.commit_message}</span>
-							</div>
-						</Show>
+							</Show>
+						</div>
 						<div class="flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
 							<Show when={run()!.commit_sha}>
 								<span class="font-mono bg-[var(--color-bg-tertiary)] px-2 py-0.5 rounded border border-[var(--color-border-primary)]">{truncateCommitSha(run()!.commit_sha)}</span>
@@ -444,9 +447,99 @@ const RunDetailPage: Component = () => {
 								<span>by {run()!.author}</span>
 							</Show>
 							<span>·</span>
+							<span class="capitalize">{run()!.trigger_type.replace('_', ' ')}</span>
+							<span>·</span>
 							<span>{formatDuration(run()!.duration_ms)}</span>
 							<span>·</span>
 							<span>{formatRelativeTime(run()!.created_at)}</span>
+						</div>
+					</div>
+				</Show>
+
+				{/* Run status summary banner */}
+				<Show when={run() && run()!.status === 'success'}>
+					{(() => {
+						const completedSteps = steps().filter(s => s.status === 'success');
+						const totalDuration = steps().reduce((sum, s) => sum + (s.duration_ms ?? 0), 0);
+						return (
+							<div class="mb-6 p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+								<div class="flex items-center gap-2 mb-1">
+									<svg class="w-5 h-5 text-emerald-400 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+										<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd" />
+									</svg>
+									<span class="text-sm font-semibold text-emerald-400">
+										All {completedSteps.length} step{completedSteps.length !== 1 ? 's' : ''} passed
+									</span>
+									<span class="text-xs text-emerald-400/60 ml-auto">{formatDuration(totalDuration)}</span>
+								</div>
+								<Show when={stages().length > 0}>
+									<div class="flex items-center gap-2 ml-7 mt-1">
+										<For each={stages()}>
+											{(stage) => (
+												<span class="text-xs text-emerald-400/70 flex items-center gap-1">
+													<svg class="w-3 h-3" viewBox="0 0 20 20" fill="currentColor">
+														<path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clip-rule="evenodd" />
+													</svg>
+													{stage.name}
+												</span>
+											)}
+										</For>
+									</div>
+								</Show>
+							</div>
+						);
+					})()}
+				</Show>
+
+				<Show when={run() && (run()!.status === 'running' || run()!.status === 'queued' || run()!.status === 'pending')}>
+					{(() => {
+						const activeSteps = steps().filter(s => s.status === 'running');
+						const completedSteps = steps().filter(s => s.status === 'success');
+						const pendingSteps = steps().filter(s => s.status === 'pending' || s.status === 'queued');
+						const totalSteps = steps().length;
+						return (
+							<div class="mb-6 p-4 rounded-xl bg-violet-500/10 border border-violet-500/30">
+								<div class="flex items-center gap-2 mb-1">
+									<svg class="w-5 h-5 text-violet-400 flex-shrink-0 animate-spin" viewBox="0 0 24 24" fill="none">
+										<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+										<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+									</svg>
+									<span class="text-sm font-semibold text-violet-400">
+										<Show when={activeSteps.length > 0} fallback={
+											run()!.status === 'queued' ? 'Waiting in queue...' : 'Preparing to run...'
+										}>
+											Running: {activeSteps.map(s => s.name).join(', ')}
+										</Show>
+									</span>
+								</div>
+								<Show when={totalSteps > 0}>
+									<div class="flex items-center gap-3 ml-7 mt-1 text-xs text-[var(--color-text-tertiary)]">
+										<Show when={completedSteps.length > 0}>
+											<span class="text-emerald-400">{completedSteps.length} passed</span>
+										</Show>
+										<Show when={activeSteps.length > 0}>
+											<span class="text-violet-400">{activeSteps.length} running</span>
+										</Show>
+										<Show when={pendingSteps.length > 0}>
+											<span>{pendingSteps.length} pending</span>
+										</Show>
+									</div>
+								</Show>
+							</div>
+						);
+					})()}
+				</Show>
+
+				<Show when={run() && run()!.status === 'cancelled'}>
+					<div class="mb-6 p-4 rounded-xl bg-gray-500/10 border border-gray-500/30">
+						<div class="flex items-center gap-2">
+							<svg class="w-5 h-5 text-gray-400 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+								<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM6.75 9.25a.75.75 0 000 1.5h6.5a.75.75 0 000-1.5h-6.5z" clip-rule="evenodd" />
+							</svg>
+							<span class="text-sm font-semibold text-gray-400">Run was cancelled</span>
+							<Show when={run()!.duration_ms}>
+								<span class="text-xs text-gray-500 ml-auto">after {formatDuration(run()!.duration_ms)}</span>
+							</Show>
 						</div>
 					</div>
 				</Show>
