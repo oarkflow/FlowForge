@@ -670,73 +670,51 @@ func generateScalaPipeline(results []DetectionResult, r DetectionResult) string 
 		},
 	})
 
-	// Deploy stage — example using AWS Elastic Beanstalk for Scala fat-jar / WAR.
-	// Uses the AWS CLI image to upload the artifact and deploy.
-	// Requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION
-	// to be configured as project secrets.
+	// Deploy stage — run the built Docker image locally.
+	// Uses docker:26-cli with privileged mode (host Docker socket) to
+	// stop any previous instance and start a fresh container.
+	// Configure APP_PORT (default 8080) and APP_NAME via project env vars.
 	stages = append(stages, stageTemplate{
 		Name: "deploy",
 		Jobs: []jobTemplate{
 			{
-				Name:  "deploy-eb",
-				Image: "amazon/aws-cli:latest",
+				Name:       "deploy-local",
+				Image:      "docker:26-cli",
+				Privileged: true,
 				Steps: []stepTemplate{
-					{Name: "Deploy to Elastic Beanstalk", Run: `echo "=== Deploying to AWS Elastic Beanstalk ==="
-# Ensure EB CLI deps are available
-yum install -y -q zip >/dev/null 2>&1 || true
+					{Name: "Deploy to Docker", Run: `APP_NAME="${APP_NAME:-my-scala-app}"
+APP_PORT="${APP_PORT:-8080}"
+HOST_PORT="${HOST_PORT:-8080}"
 
-APP_NAME="${AWS_EB_APP_NAME:-my-scala-app}"
-ENV_NAME="${AWS_EB_ENV_NAME:-my-scala-app-env}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-VERSION_LABEL="v$(date +%Y%m%d%H%M%S)"
+echo "=== Deploying $APP_NAME ==="
 
-# Find the built artifact (fat jar or WAR)
-JAR_FILE=$(find target/ -maxdepth 2 -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
-if [ -z "$JAR_FILE" ]; then
-  echo "No JAR found in target/, looking for WAR..."
-  JAR_FILE=$(find target/ -maxdepth 2 -name "*.war" | head -1)
+# Stop and remove any existing container with the same name
+if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
+  echo "Stopping existing container: $APP_NAME"
+  docker stop "$APP_NAME" 2>/dev/null || true
+  docker rm "$APP_NAME" 2>/dev/null || true
 fi
 
-if [ -z "$JAR_FILE" ]; then
-  echo "Error: No deployable artifact (JAR/WAR) found in target/"
-  ls -la target/ 2>/dev/null
+# Run the new container
+echo "Starting container: $APP_NAME (port $HOST_PORT -> $APP_PORT)"
+docker run -d \
+  --name "$APP_NAME" \
+  --restart unless-stopped \
+  -p "${HOST_PORT}:${APP_PORT}" \
+  app:latest
+
+# Verify the container started
+sleep 2
+if docker ps --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
+  echo "Container $APP_NAME is running"
+  docker ps --filter "name=$APP_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+  echo ""
+  echo "Application available at http://localhost:${HOST_PORT}"
+else
+  echo "Error: Container failed to start"
+  docker logs "$APP_NAME" 2>&1 | tail -20
   exit 1
-fi
-
-echo "Deploying artifact: $JAR_FILE"
-
-# Create deployment bundle
-BUNDLE_DIR=$(mktemp -d)
-cp "$JAR_FILE" "$BUNDLE_DIR/application.jar"
-
-# Create Procfile for EB
-cat > "$BUNDLE_DIR/Procfile" << 'PROCFILE'
-web: java -jar application.jar
-PROCFILE
-
-# Zip the bundle
-(cd "$BUNDLE_DIR" && zip -r /tmp/deploy-bundle.zip .)
-
-# Upload to S3 and create EB application version
-S3_BUCKET="${AWS_EB_S3_BUCKET:-elasticbeanstalk-${REGION}-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo unknown)}"
-S3_KEY="$APP_NAME/$VERSION_LABEL.zip"
-
-aws s3 cp /tmp/deploy-bundle.zip "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
-
-aws elasticbeanstalk create-application-version \
-  --application-name "$APP_NAME" \
-  --version-label "$VERSION_LABEL" \
-  --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
-  --region "$REGION"
-
-aws elasticbeanstalk update-environment \
-  --application-name "$APP_NAME" \
-  --environment-name "$ENV_NAME" \
-  --version-label "$VERSION_LABEL" \
-  --region "$REGION"
-
-echo "Deployed $VERSION_LABEL to $ENV_NAME"
-echo "Monitor: https://${REGION}.console.aws.amazon.com/elasticbeanstalk/home?region=${REGION}#/environment/dashboard?environmentId=${ENV_NAME}"`},
+fi`},
 				},
 			},
 		},
