@@ -1,0 +1,75 @@
+# ==============================================================================
+# FlowForge Backend — Multi-stage Docker Build
+# Requires CGO_ENABLED=1 for mattn/go-sqlite3
+# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build
+# ---------------------------------------------------------------------------
+FROM golang:1.26-alpine AS builder
+
+# Install build dependencies required for CGO (sqlite3)
+RUN apk add --no-cache gcc musl-dev sqlite-dev
+
+WORKDIR /app
+
+# Cache dependency downloads
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+
+# Copy backend source
+COPY backend/ .
+
+# Build with CGO enabled for sqlite3 support
+ENV CGO_ENABLED=1
+RUN go build \
+    -ldflags="-w -s -X main.version=$(date +%Y%m%d)" \
+    -trimpath \
+    -o /app/flowforge-server \
+    ./cmd/server
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+FROM alpine:3.19
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    sqlite-libs \
+    tzdata \
+    git \
+    && addgroup -S flowforge \
+    && adduser -S -G flowforge flowforge
+
+WORKDIR /app
+
+# Create data directory for SQLite database and artifacts
+RUN mkdir -p /data && chown flowforge:flowforge /data
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/flowforge-server /app/flowforge-server
+
+# Copy migration files if they exist
+COPY --from=builder /app/internal/db/migrations/ /app/migrations/
+
+# Set ownership
+RUN chown -R flowforge:flowforge /app
+
+USER flowforge
+
+# Expose API port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- http://localhost:8080/api/v1/system/health || exit 1
+
+# Environment defaults
+ENV DATABASE_PATH=/data/flowforge.db
+ENV PORT=8080
+ENV LOG_LEVEL=info
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["/app/flowforge-server"]

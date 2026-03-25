@@ -1,0 +1,131 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flowforge
+  namespace: flowforge
+  labels:
+    app.kubernetes.io/name: flowforge
+    app.kubernetes.io/part-of: flowforge
+  annotations:
+    # TLS via cert-manager
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # nginx ingress controller settings
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # WebSocket support
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - flowforge.example.com
+      secretName: flowforge-tls
+  rules:
+    - host: flowforge.example.com
+      http:
+        paths:
+          # API and WebSocket routes to backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: flowforge-server
+                port:
+                  name: http
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: flowforge-server
+                port:
+                  name: http
+          - path: /webhooks
+            pathType: Prefix
+            backend:
+              service:
+                name: flowforge-server
+                port:
+                  name: http
+          # All other routes to frontend
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flowforge-frontend
+                port:
+                  name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowforge-frontend
+  namespace: flowforge
+  labels:
+    app.kubernetes.io/name: flowforge-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: flowforge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: flowforge-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowforge-frontend
+  namespace: flowforge
+  labels:
+    app.kubernetes.io/name: flowforge-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: flowforge
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flowforge-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flowforge-frontend
+        app.kubernetes.io/component: frontend
+        app.kubernetes.io/part-of: flowforge
+    spec:
+      containers:
+        - name: frontend
+          image: flowforge/frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30

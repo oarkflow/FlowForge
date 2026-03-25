@@ -1,0 +1,36 @@
+I want to build a robust, comprehensive and modern CI/CD platform in go and SolidJS/tailwindcss.
+I should be able to to connect to my Repositories manager like Github, Gitlab, Bitbucket and trigger pipelines on push, pull request, schedule or manual trigger.
+The platform should be able to run pipelines in a distributed manner or concurrently on same machine and should be able to scale horizontally when distributed.
+Features:
+- Support for multiple repository managers (Github, Gitlab, Bitbucket)
+- Trigger pipelines on push, pull request, schedule or manual trigger
+- Distributed pipeline execution
+- Horizontal scaling for distributed execution
+- Real-time pipeline monitoring and logging
+- Integration with popular notification services (Slack, Email)
+- Support for custom pipeline configurations (YAML/JSON)
+- Role-based access control for pipeline management
+- Support for pipeline templates and reusable components
+- Integration with containerization platforms (Docker, Kubernetes)
+- Support for multiple programming languages and frameworks
+- Comprehensive API for pipeline management and integration with other tools
+- User-friendly web interface for pipeline management and monitoring
+- Support for pipeline versioning and rollback
+- Integration with testing frameworks for automated testing in pipelines
+- Support for artifact management and storage
+- and many more features to make it a robust and comprehensive CI/CD platform.
+
+The platform should be able to detect programming languages, frameworks and dependencies used in the repository and automatically configure the pipeline accordingly.
+It should also provide options for custom pipeline configurations for advanced users.
+The platform should be designed with security in mind, ensuring that sensitive information such as API keys and credentials are securely stored and managed.
+Additionally, it should provide detailed documentation and support for users to easily get started and troubleshoot any issues that may arise.
+
+Another most important feature is to integrate multiple pipeline dependencies and steps in a single pipeline configuration, allowing users to define complex workflows with ease.
+I should be able to add artifacts from one pipeline successfull build to another pipeline as a dependency, allowing for seamless integration and efficient workflow management.
+The platform should also support parallel execution of pipeline steps, allowing for faster build and deployment times.
+I should be able to add files, environment variables, secrets and other necessary configurations to the pipeline steps, ensuring that the pipeline can be executed successfully in different environments.
+The platform should also provide options for pipeline notifications, allowing users to receive updates on pipeline status and results through various channels such as email, Slack, or other messaging platforms.
+Overall, the platform should be designed to be flexible, scalable, and user-friendly, providing a seamless experience for developers and DevOps teams to manage their CI/CD pipelines effectively.
+
+For Deployment, I should be able to deploy the platform on various cloud providers (AWS, GCP, Azure) as well as on-premises infrastructure.
+The platform should also support containerization and orchestration using Docker and Kubernetes, allowing for easy deployment and management of the platform in different environments.

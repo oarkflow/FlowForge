@@ -1,0 +1,93 @@
+# ==============================================================================
+# FlowForge — Development Docker Compose (with hot reload)
+# Usage: docker compose -f docker-compose.dev.yml up
+# ==============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # Backend with Air hot reload
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.backend
+      target: builder
+    container_name: flowforge-backend-dev
+    working_dir: /app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend:/app
+      - ./data:/data
+      - go-cache:/root/go/pkg/mod
+    environment:
+      - DATABASE_PATH=/data/flowforge.db
+      - PORT=8080
+      - JWT_SECRET=dev-secret-change-in-prod
+      - ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
+      - ALLOWED_ORIGINS=http://localhost:3000
+      - LOG_LEVEL=debug
+      - ARTIFACT_STORAGE_BACKEND=local
+      - ARTIFACT_STORAGE_PATH=/data/artifacts
+    command: >
+      sh -c "
+        go install github.com/air-verse/air@latest &&
+        air -c .air.toml 2>/dev/null ||
+        air --build.cmd 'go build -o /tmp/flowforge-server ./cmd/server'
+            --build.bin '/tmp/flowforge-server'
+            --build.include_ext 'go'
+            --build.exclude_dir 'vendor,tmp,data'
+      "
+    networks:
+      - flowforge-dev
+
+  # --------------------------------------------------------------------------
+  # Frontend with Vite dev server (HMR)
+  # --------------------------------------------------------------------------
+  frontend:
+    image: node:20-alpine
+    container_name: flowforge-frontend-dev
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - node-modules:/app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8080
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - backend
+    networks:
+      - flowforge-dev
+
+  # --------------------------------------------------------------------------
+  # MinIO (S3-compatible object storage for artifact testing)
+  # --------------------------------------------------------------------------
+  minio:
+    image: minio/minio
+    container_name: flowforge-minio-dev
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    networks:
+      - flowforge-dev
+
+volumes:
+  go-cache:
+    driver: local
+  node-modules:
+    driver: local
+  minio-data:
+    driver: local
+
+networks:
+  flowforge-dev:
+    driver: bridge
