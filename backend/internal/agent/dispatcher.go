@@ -196,6 +196,12 @@ func (d *Dispatcher) QueueSize() int {
 	return len(d.queue)
 }
 
+// QueueDepth returns the current number of jobs waiting in the dispatch queue.
+// Alias for QueueSize, used by the auto-scaler.
+func (d *Dispatcher) QueueDepth() int {
+	return len(d.queue)
+}
+
 // MarshalJobRequest serializes a job request to JSON for transmission.
 func MarshalJobRequest(req *JobRequest) (string, error) {
 	data, err := json.Marshal(req)

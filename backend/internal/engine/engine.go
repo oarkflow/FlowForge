@@ -25,13 +25,14 @@ import (
 // Engine is the central pipeline execution engine. It manages the job queue,
 // scheduler, and runner to orchestrate pipeline execution.
 type Engine struct {
-	db        *sqlx.DB
-	hub       *websocket.Hub
-	cfg       *config.Config
-	repos     *queries.Repositories
-	queue     *queue.PriorityQueue
-	scheduler *scheduler.Scheduler
-	runner    *Runner
+	db          *sqlx.DB
+	hub         *websocket.Hub
+	cfg         *config.Config
+	repos       *queries.Repositories
+	queue       *queue.PriorityQueue
+	scheduler   *scheduler.Scheduler
+	runner      *Runner
+	composition *pipeline.CompositionService
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -44,10 +45,7 @@ func New(db *sqlx.DB, hub *websocket.Hub, cfg *config.Config) *Engine {
 	sched := scheduler.New(q, db, hub)
 	runner := NewRunner(repos, hub)
 
-	// Wire the scheduler to use the runner for executing pipelines
-	sched.SetRunFunc(runner.RunPipeline)
-
-	return &Engine{
+	e := &Engine{
 		db:        db,
 		hub:       hub,
 		cfg:       cfg,
@@ -56,6 +54,54 @@ func New(db *sqlx.DB, hub *websocket.Hub, cfg *config.Config) *Engine {
 		scheduler: sched,
 		runner:    runner,
 	}
+
+	// Wire the scheduler to use the runner for executing pipelines
+	sched.SetRunFunc(runner.RunPipeline)
+
+	// Set up composition service with a trigger function that calls back into this engine.
+	// The trigger function wraps TriggerPipeline to ignore the returned run (we just need error).
+	triggerFn := func(ctx context.Context, pipelineID, triggerType string, triggerData map[string]string) error {
+		_, err := e.TriggerPipeline(ctx, pipelineID, triggerType, triggerData)
+		return err
+	}
+	e.composition = pipeline.NewCompositionService(repos, triggerFn)
+
+	// Wire the scheduler's completion callback for pipeline composition
+	sched.SetOnCompleteFunc(e.onRunComplete)
+
+	return e
+}
+
+// onRunComplete is called when a pipeline run finishes. It handles
+// downstream pipeline triggers via the composition service.
+func (e *Engine) onRunComplete(ctx context.Context, runID, status string) {
+	// Look up the run to get the pipeline ID
+	run, err := e.repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		log.Error().Err(err).Str("run_id", runID).Msg("engine: failed to look up run for composition")
+		return
+	}
+
+	// Extract chain depth from trigger data to prevent infinite loops
+	depth := 0
+	if run.TriggerData != nil {
+		var td map[string]string
+		if json.Unmarshal([]byte(*run.TriggerData), &td) == nil {
+			if d, ok := td["chain_depth"]; ok {
+				fmt.Sscanf(d, "%d", &depth)
+			}
+		}
+	}
+
+	// Trigger downstream pipelines asynchronously
+	go func() {
+		if err := e.composition.TriggerDownstream(context.Background(), run.PipelineID, status, nil, depth); err != nil {
+			log.Error().Err(err).
+				Str("pipeline_id", run.PipelineID).
+				Str("run_id", runID).
+				Msg("engine: downstream trigger failed")
+		}
+	}()
 }
 
 // Start begins the engine's background goroutines (scheduler loop).
@@ -661,17 +707,23 @@ func specToSchedulerConfig(spec *pipeline.PipelineSpec) scheduler.PipelineConfig
 		stageJobs[stageName] = append(stageJobs[stageName], jc)
 	}
 
-	// Build ordered stage configs
+	// Build ordered stage configs, propagating stage-level needs
 	var stages []scheduler.StageConfig
 	for _, stageName := range stageOrder {
 		jobs, ok := stageJobs[stageName]
 		if !ok || len(jobs) == 0 {
 			continue
 		}
-		stages = append(stages, scheduler.StageConfig{
+		sc := scheduler.StageConfig{
 			Name: stageName,
 			Jobs: jobs,
-		})
+		}
+		if spec.StageNeeds != nil {
+			if needs, ok := spec.StageNeeds[stageName]; ok {
+				sc.Needs = needs
+			}
+		}
+		stages = append(stages, sc)
 	}
 
 	if len(stages) == 0 {

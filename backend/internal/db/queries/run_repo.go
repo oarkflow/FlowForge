@@ -34,6 +34,7 @@ func (r *RunRepo) ListAllRuns(ctx context.Context, status string, limit, offset 
 		SELECT
 			pr.*,
 			p.name AS pipeline_name,
+			p.is_active AS pipeline_is_active,
 			proj.id AS project_id,
 			proj.name AS project_name
 		FROM pipeline_runs pr
@@ -179,7 +180,7 @@ func (r *RunRepo) UpdateStepRunStatus(ctx context.Context, id, status string) er
 // ListJobRunsByRunID returns all job runs for a given pipeline run.
 func (r *RunRepo) ListJobRunsByRunID(ctx context.Context, runID string) ([]models.JobRun, error) {
 	jobs := []models.JobRun{}
-	err := r.db.SelectContext(ctx, &jobs, "SELECT * FROM job_runs WHERE run_id = ? ORDER BY rowid ASC", runID)
+	err := r.db.SelectContext(ctx, &jobs, "SELECT * FROM job_runs WHERE run_id = ? ORDER BY id ASC", runID)
 	return jobs, err
 }
 
@@ -190,6 +191,6 @@ func (r *RunRepo) ListStepRunsByRunID(ctx context.Context, runID string) ([]mode
 		`SELECT s.* FROM step_runs s
 		 JOIN job_runs j ON j.id = s.job_run_id
 		 WHERE j.run_id = ?
-		 ORDER BY s.rowid ASC`, runID)
+		 ORDER BY s.id ASC`, runID)
 	return steps, err
 }

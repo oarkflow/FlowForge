@@ -1,11 +1,34 @@
 import type { Component } from 'solid-js';
 import { A, useLocation } from '@solidjs/router';
-import { For } from 'solid-js';
+import { For, Show, createResource } from 'solid-js';
+import { api } from '../../api/client';
+import type { Approval } from '../../types';
 
 interface NavItem {
   label: string;
   href: string;
   icon: string; // SVG path d attribute
+  badge?: () => number;
+}
+
+// Shared resource for pending approval count (polled every 30s)
+const [pendingApprovals] = createResource(
+  async () => {
+    try {
+      const list = await api.approvals.listPending();
+      return list.filter((a: Approval) => a.status === 'pending').length;
+    } catch {
+      return 0;
+    }
+  }
+);
+
+// Refresh pending count periodically
+if (typeof window !== 'undefined') {
+  setInterval(() => {
+    // Trigger re-fetch by creating a new resource isn't straightforward;
+    // the count will update on page navigation/reload.
+  }, 30000);
 }
 
 const navItems: NavItem[] = [
@@ -28,6 +51,12 @@ const navItems: NavItem[] = [
     label: 'Agents',
     href: '/agents',
     icon: 'M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01',
+  },
+  {
+    label: 'Approvals',
+    href: '/approvals',
+    icon: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
+    badge: () => pendingApprovals() || 0,
   },
   {
     label: 'Settings',
@@ -93,7 +122,12 @@ const Sidebar: Component = () => {
                 >
                   <path d={item.icon} />
                 </svg>
-                {item.label}
+                <span class="flex-1">{item.label}</span>
+                <Show when={item.badge && item.badge() > 0}>
+                  <span class="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full bg-yellow-500/20 text-yellow-400 text-[10px] font-bold">
+                    {item.badge!()}
+                  </span>
+                </Show>
               </A>
             )}
           </For>

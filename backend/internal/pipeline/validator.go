@@ -27,6 +27,7 @@ func Validate(spec *PipelineSpec) []ValidationError {
 	errs = append(errs, validateJobs(spec)...)
 	errs = append(errs, validateDependencies(spec)...)
 	errs = append(errs, validateTriggers(spec)...)
+	errs = append(errs, validateStageNeeds(spec)...)
 
 	return errs
 }
@@ -301,4 +302,56 @@ func TopologicalSort(spec *PipelineSpec) ([]string, error) {
 	}
 
 	return sorted, nil
+}
+
+// validateStageNeeds validates stage-level needs declarations by checking the
+// stage_needs map against the stages list. Detects undefined references,
+// self-references, and cycles using the DAG builder.
+func validateStageNeeds(spec *PipelineSpec) []ValidationError {
+	if len(spec.StageNeeds) == 0 || len(spec.Stages) == 0 {
+		return nil
+	}
+
+	var errs []ValidationError
+
+	stageSet := make(map[string]bool, len(spec.Stages))
+	for _, s := range spec.Stages {
+		stageSet[s] = true
+	}
+
+	// Validate references
+	for stageName, deps := range spec.StageNeeds {
+		if !stageSet[stageName] {
+			errs = append(errs, ValidationError{
+				Field:   fmt.Sprintf("stage_needs.%s", stageName),
+				Message: fmt.Sprintf("references undefined stage %q", stageName),
+			})
+			continue
+		}
+		for _, dep := range deps {
+			if dep == stageName {
+				errs = append(errs, ValidationError{
+					Field:   fmt.Sprintf("stage_needs.%s", stageName),
+					Message: "self-reference in stage needs",
+				})
+			}
+			if !stageSet[dep] {
+				errs = append(errs, ValidationError{
+					Field:   fmt.Sprintf("stage_needs.%s", stageName),
+					Message: fmt.Sprintf("references undefined dependency stage %q", dep),
+				})
+			}
+		}
+	}
+
+	// Check for cycles using the DAG builder
+	dagErrs := ValidateStageDAG(spec.Stages, spec.StageNeeds)
+	for _, e := range dagErrs {
+		errs = append(errs, ValidationError{
+			Field:   "stage_needs",
+			Message: e,
+		})
+	}
+
+	return errs
 }

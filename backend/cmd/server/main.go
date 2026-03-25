@@ -25,6 +25,7 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/engine"
 	"github.com/oarkflow/deploy/backend/internal/importer"
 	"github.com/oarkflow/deploy/backend/internal/notifications"
+	"github.com/oarkflow/deploy/backend/internal/scheduler"
 	"github.com/oarkflow/deploy/backend/internal/storage"
 	ws "github.com/oarkflow/deploy/backend/internal/websocket"
 	"github.com/oarkflow/deploy/backend/internal/worker"
@@ -38,8 +39,13 @@ func main() {
 	appLog.Info().Str("port", cfg.Port).Msg("starting FlowForge server")
 
 	// Database
-	database := db.Connect(cfg.DatabasePath)
+	database, err := db.Connect(cfg.DatabasePath)
+	if err != nil {
+		log.Fatalf("database connection failed: %v", err)
+	}
 	defer database.Close()
+
+	appLog.Info().Msg("database connection established")
 
 	if err := db.Migrate(database); err != nil {
 		log.Fatalf("migration failed: %v", err)
@@ -102,8 +108,16 @@ func main() {
 	go agentDispatcher.Start(dispatchCtx)
 
 	// Background Worker Pool
+	schedulerSvc := scheduler.NewService(repos)
+	schedulerSvc.SetEngine(eng)
+
+	// Auto-Scaler
+	autoScaler := agentpkg.NewAutoScaler(repos, agentPool, agentDispatcher)
+
 	workerPool := worker.NewPool(database)
 	workerPool.SetEngine(eng)
+	workerPool.SetScheduler(schedulerSvc)
+	workerPool.SetAutoScaler(autoScaler)
 	workerPool.RegisterDefaults()
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	go workerPool.Start(workerCtx)
@@ -146,7 +160,7 @@ func main() {
 
 	appLog.Info().
 		Str("port", cfg.Port).
-		Str("db", cfg.DatabasePath).
+		Str("database", cfg.DatabasePath).
 		Bool("embedded_worker", cfg.EmbeddedWorker).
 		Msg("FlowForge server is running")
 

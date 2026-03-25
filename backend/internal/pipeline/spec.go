@@ -4,14 +4,15 @@ import "encoding/json"
 
 // PipelineSpec is the top-level pipeline configuration matching flowforge.yml.
 type PipelineSpec struct {
-	Version  string             `yaml:"version" json:"version"`
-	Name     string             `yaml:"name" json:"name"`
-	On       TriggerConfig      `yaml:"on" json:"on"`
-	Defaults *DefaultsConfig    `yaml:"defaults,omitempty" json:"defaults,omitempty"`
-	Env      map[string]string  `yaml:"env,omitempty" json:"env,omitempty"`
-	Stages   []string           `yaml:"stages,omitempty" json:"stages,omitempty"`
-	Jobs     map[string]JobSpec `yaml:"jobs" json:"jobs"`
-	Notify   *NotifyConfig      `yaml:"notify,omitempty" json:"notify,omitempty"`
+	Version    string                `yaml:"version" json:"version"`
+	Name       string                `yaml:"name" json:"name"`
+	On         TriggerConfig         `yaml:"on" json:"on"`
+	Defaults   *DefaultsConfig       `yaml:"defaults,omitempty" json:"defaults,omitempty"`
+	Env        map[string]string     `yaml:"env,omitempty" json:"env,omitempty"`
+	Stages     []string              `yaml:"stages,omitempty" json:"stages,omitempty"`
+	StageNeeds map[string][]string   `yaml:"stage_needs,omitempty" json:"stage_needs,omitempty"` // stage-level DAG dependencies: stage_name → [dependency_stage_names]
+	Jobs       map[string]JobSpec    `yaml:"jobs" json:"jobs"`
+	Notify     *NotifyConfig         `yaml:"notify,omitempty" json:"notify,omitempty"`
 }
 
 // TriggerConfig holds all pipeline trigger definitions.

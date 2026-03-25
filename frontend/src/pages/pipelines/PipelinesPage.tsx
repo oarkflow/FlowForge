@@ -1,6 +1,6 @@
 import type { Component } from 'solid-js';
 import { createSignal, createResource, createMemo, For, Show, onMount } from 'solid-js';
-import { useParams, A } from '@solidjs/router';
+import { useParams, A, useNavigate } from '@solidjs/router';
 import PageContainer from '../../components/layout/PageContainer';
 import Card from '../../components/ui/Card';
 import Badge from '../../components/ui/Badge';
@@ -129,10 +129,22 @@ function makeRunColumns(projectId: string): TableColumn<PipelineRun>[] {
 }
 
 // ---------------------------------------------------------------------------
+// Trigger helpers
+// ---------------------------------------------------------------------------
+function parseTriggers(triggers: Record<string, unknown> | string | undefined): Record<string, unknown> {
+  if (!triggers) return {};
+  if (typeof triggers === 'string') {
+    try { return JSON.parse(triggers) || {}; } catch { return {}; }
+  }
+  return triggers;
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 const PipelinesPage: Component = () => {
   const params = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = createSignal('pipelines');
   const [runFilter, setRunFilter] = createSignal('all');
   const [showCreate, setShowCreate] = createSignal(false);
@@ -141,6 +153,11 @@ const PipelinesPage: Component = () => {
   const [triggerPipelineId, setTriggerPipelineId] = createSignal('');
   const [triggerBranch, setTriggerBranch] = createSignal('main');
   const [triggering, setTriggering] = createSignal(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = createSignal(false);
+  const [deletePipelineId, setDeletePipelineId] = createSignal('');
+  const [deletePipelineName, setDeletePipelineName] = createSignal('');
+  const [deleting, setDeleting] = createSignal(false);
+  const [togglingId, setTogglingId] = createSignal<string | null>(null);
 
   // Create form
   const [newPipelineName, setNewPipelineName] = createSignal('');
@@ -241,6 +258,45 @@ const PipelinesPage: Component = () => {
     setShowTrigger(true);
   };
 
+  const handleToggleActive = async (e: Event, pipelineId: string, currentlyActive: boolean) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setTogglingId(pipelineId);
+    try {
+      await api.pipelines.update(params.id, pipelineId, { is_active: currentlyActive ? 0 : 1 } as any);
+      toast.success(currentlyActive ? 'Pipeline disabled' : 'Pipeline enabled');
+      refetch();
+    } catch (err) {
+      const msg = err instanceof ApiRequestError ? err.message : 'Failed to update pipeline';
+      toast.error(msg);
+    } finally {
+      setTogglingId(null);
+    }
+  };
+
+  const openDeleteModal = (e: Event, pipelineId: string, pipelineName: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDeletePipelineId(pipelineId);
+    setDeletePipelineName(pipelineName);
+    setShowDeleteConfirm(true);
+  };
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      await api.pipelines.delete(params.id, deletePipelineId());
+      toast.success('Pipeline deleted');
+      setShowDeleteConfirm(false);
+      refetch();
+    } catch (err) {
+      const msg = err instanceof ApiRequestError ? err.message : 'Failed to delete pipeline';
+      toast.error(msg);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <PageContainer
       title="Pipelines"
@@ -299,80 +355,124 @@ const PipelinesPage: Component = () => {
           }>
             <div class="space-y-4">
               <For each={pipelines()}>
-                {(pipeline) => (
-                  <A href={`/projects/${params.id}/pipelines/${pipeline.id}`} class="block">
-                    <div class="bg-[var(--color-bg-secondary)] border border-[var(--color-border-primary)] rounded-xl p-5 hover:border-[var(--color-border-secondary)] transition-all">
-                      <div class="flex items-start justify-between">
-                        <div class="flex items-start gap-4">
-                          <div class={`w-3 h-3 rounded-full mt-1.5 ${pipeline.is_active ? 'bg-emerald-400' : 'bg-gray-500'}`} />
-                          <div>
-                            <div class="flex items-center gap-2">
-                              <h3 class="text-sm font-semibold text-[var(--color-text-primary)]">{pipeline.name}</h3>
-                              <Badge variant={pipeline.is_active ? 'success' : 'default'} size="sm">
-                                {pipeline.is_active ? 'Active' : 'Disabled'}
+                {(pipeline) => {
+                  const triggers = () => parseTriggers(pipeline.triggers);
+                  return (
+                    <A href={`/projects/${params.id}/pipelines/${pipeline.id}`} class="block">
+                      <div class="bg-[var(--color-bg-secondary)] border border-[var(--color-border-primary)] rounded-xl p-5 hover:border-[var(--color-border-secondary)] transition-all">
+                        <div class="flex items-start justify-between">
+                          <div class="flex items-start gap-4">
+                            <div class={`w-3 h-3 rounded-full mt-1.5 ${pipeline.is_active ? 'bg-emerald-400' : 'bg-gray-500'}`} />
+                            <div>
+                              <div class="flex items-center gap-2">
+                                <h3 class="text-sm font-semibold text-[var(--color-text-primary)]">{pipeline.name}</h3>
+                                <Badge variant={pipeline.is_active ? 'success' : 'default'} size="sm">
+                                  {pipeline.is_active ? 'Active' : 'Disabled'}
+                                </Badge>
+                              </div>
+                              <Show when={pipeline.description}>
+                                <p class="text-xs text-[var(--color-text-tertiary)] mt-0.5">{pipeline.description}</p>
+                              </Show>
+
+                              {/* Triggers */}
+                              <div class="flex items-center gap-2 mt-2">
+                                <Show when={triggers().push}>
+                                  <span class="text-xs px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">push</span>
+                                </Show>
+                                <Show when={triggers().pull_request}>
+                                  <span class="text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">PR</span>
+                                </Show>
+                                <Show when={triggers().manual}>
+                                  <span class="text-xs px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-400 border border-violet-500/20">manual</span>
+                                </Show>
+                                <Show when={triggers().schedule}>
+                                  <span class="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">schedule</span>
+                                </Show>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div class="flex items-center gap-4">
+                            {/* Action buttons */}
+                            <div class="flex items-center gap-1">
+                              {/* Toggle active */}
+                              <button
+                                onClick={(e) => handleToggleActive(e, pipeline.id, pipeline.is_active)}
+                                disabled={togglingId() === pipeline.id}
+                                class="p-1.5 rounded-md text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50"
+                                title={pipeline.is_active ? 'Disable pipeline' : 'Enable pipeline'}
+                              >
+                                <Show when={togglingId() === pipeline.id} fallback={
+                                  <Show when={pipeline.is_active} fallback={
+                                    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" /></svg>
+                                  }>
+                                    <svg class="w-4 h-4 text-emerald-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd" /></svg>
+                                  </Show>
+                                }>
+                                  <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" /><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                                </Show>
+                              </button>
+
+                              {/* Trigger run */}
+                              <button
+                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); openTriggerModal(pipeline.id); }}
+                                disabled={!pipeline.is_active}
+                                class="p-1.5 rounded-md text-[var(--color-text-tertiary)] hover:text-indigo-400 hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:text-[var(--color-text-tertiary)] disabled:hover:bg-transparent"
+                                title={pipeline.is_active ? 'Trigger run' : 'Enable pipeline to trigger runs'}
+                              >
+                                <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" /></svg>
+                              </button>
+
+                              {/* Delete */}
+                              <button
+                                onClick={(e) => openDeleteModal(e, pipeline.id, pipeline.name)}
+                                class="p-1.5 rounded-md text-[var(--color-text-tertiary)] hover:text-red-400 hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                                title="Delete pipeline"
+                              >
+                                <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd" /></svg>
+                              </button>
+                            </div>
+
+                            {/* Stats */}
+                            <div class="text-right">
+                              <p class="text-xs text-[var(--color-text-tertiary)]">{pipeline.run_count} runs</p>
+                              <Show when={pipeline.success_rate > 0}>
+                                <p class={`text-xs font-medium mt-0.5 ${pipeline.success_rate >= 90 ? 'text-emerald-400' : pipeline.success_rate >= 70 ? 'text-amber-400' : 'text-red-400'}`}>
+                                  {pipeline.success_rate}% pass rate
+                                </p>
+                              </Show>
+                            </div>
+                            <Show when={pipeline.last_run}>
+                              <Badge variant={getStatusBadgeVariant(pipeline.last_run!.status)} dot size="sm">
+                                {statusLabel[pipeline.last_run!.status]}
                               </Badge>
-                            </div>
-                            <Show when={pipeline.description}>
-                              <p class="text-xs text-[var(--color-text-tertiary)] mt-0.5">{pipeline.description}</p>
                             </Show>
-
-                            {/* Triggers */}
-                            <div class="flex items-center gap-2 mt-2">
-                              <Show when={pipeline.triggers.push}>
-                                <span class="text-xs px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">push</span>
-                              </Show>
-                              <Show when={pipeline.triggers.pull_request}>
-                                <span class="text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">PR</span>
-                              </Show>
-                              <Show when={pipeline.triggers.manual}>
-                                <span class="text-xs px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-400 border border-violet-500/20">manual</span>
-                              </Show>
-                              <Show when={pipeline.triggers.schedule}>
-                                <span class="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">schedule</span>
-                              </Show>
-                            </div>
                           </div>
                         </div>
 
-                        <div class="flex items-center gap-6 text-right">
-                          <div>
-                            <p class="text-xs text-[var(--color-text-tertiary)]">{pipeline.run_count} runs</p>
-                            <Show when={pipeline.success_rate > 0}>
-                              <p class={`text-xs font-medium mt-0.5 ${pipeline.success_rate >= 90 ? 'text-emerald-400' : pipeline.success_rate >= 70 ? 'text-amber-400' : 'text-red-400'}`}>
-                                {pipeline.success_rate}% pass rate
-                              </p>
+                        {/* Last run info */}
+                        <Show when={pipeline.last_run}>
+                          <div class="flex items-center gap-3 mt-3 pt-3 border-t border-[var(--color-border-primary)] text-xs text-[var(--color-text-tertiary)]">
+                            <span>#{pipeline.last_run!.number}</span>
+                            <Show when={pipeline.last_run!.commit_sha}>
+                              <span class="font-mono">{truncateCommitSha(pipeline.last_run!.commit_sha)}</span>
                             </Show>
+                            <Show when={pipeline.last_run!.branch}>
+                              <span>on {pipeline.last_run!.branch}</span>
+                            </Show>
+                            <Show when={pipeline.last_run!.author}>
+                              <span>by {pipeline.last_run!.author}</span>
+                            </Show>
+                            <Show when={pipeline.last_run!.duration_ms}>
+                              <span>{formatDuration(pipeline.last_run!.duration_ms)}</span>
+                            </Show>
+                            <span>{formatRelativeTime(pipeline.last_run!.created_at)}</span>
                           </div>
-                          <Show when={pipeline.last_run}>
-                            <Badge variant={getStatusBadgeVariant(pipeline.last_run!.status)} dot size="sm">
-                              {statusLabel[pipeline.last_run!.status]}
-                            </Badge>
-                          </Show>
-                        </div>
+                        </Show>
                       </div>
-
-                      {/* Last run info */}
-                      <Show when={pipeline.last_run}>
-                        <div class="flex items-center gap-3 mt-3 pt-3 border-t border-[var(--color-border-primary)] text-xs text-[var(--color-text-tertiary)]">
-                          <span>#{pipeline.last_run!.number}</span>
-                          <Show when={pipeline.last_run!.commit_sha}>
-                            <span class="font-mono">{truncateCommitSha(pipeline.last_run!.commit_sha)}</span>
-                          </Show>
-                          <Show when={pipeline.last_run!.branch}>
-                            <span>on {pipeline.last_run!.branch}</span>
-                          </Show>
-                          <Show when={pipeline.last_run!.author}>
-                            <span>by {pipeline.last_run!.author}</span>
-                          </Show>
-                          <Show when={pipeline.last_run!.duration_ms}>
-                            <span>{formatDuration(pipeline.last_run!.duration_ms)}</span>
-                          </Show>
-                          <span>{formatRelativeTime(pipeline.last_run!.created_at)}</span>
-                        </div>
-                      </Show>
-                    </div>
-                  </A>
-                )}
+                    </A>
+                  );
+                }}
               </For>
             </div>
           </Show>
@@ -432,6 +532,20 @@ const PipelinesPage: Component = () => {
         </Modal>
       </Show>
 
+      {/* Delete Pipeline Modal */}
+      <Show when={showDeleteConfirm()}>
+        <Modal open={showDeleteConfirm()} onClose={() => setShowDeleteConfirm(false)} title="Delete Pipeline" description="This action cannot be undone." footer={
+          <>
+            <Button variant="ghost" onClick={() => setShowDeleteConfirm(false)}>Cancel</Button>
+            <Button variant="danger" loading={deleting()} onClick={handleDelete}>Delete Pipeline</Button>
+          </>
+        }>
+          <p class="text-sm text-[var(--color-text-secondary)]">
+            Are you sure you want to delete <strong class="text-[var(--color-text-primary)]">{deletePipelineName()}</strong>? All pipeline runs, logs, and artifacts will be permanently removed.
+          </p>
+        </Modal>
+      </Show>
+
       {/* Trigger Pipeline Modal */}
       <Show when={showTrigger()}>
         <Modal open={showTrigger()} onClose={() => setShowTrigger(false)} title="Trigger Pipeline" description="Manually start a new pipeline run" footer={
@@ -443,7 +557,7 @@ const PipelinesPage: Component = () => {
           <div class="space-y-4">
             <Show when={pipelines().length > 1}>
               <Select label="Pipeline" value={triggerPipelineId()} onChange={(e) => setTriggerPipelineId(e.currentTarget.value)} options={
-                pipelines().map(p => ({ value: p.id, label: p.name }))
+                pipelines().filter(p => p.is_active).map(p => ({ value: p.id, label: p.name }))
               } />
             </Show>
             <Input label="Branch" value={triggerBranch()} onInput={(e) => setTriggerBranch(e.currentTarget.value)} placeholder="main" />

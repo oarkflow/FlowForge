@@ -8,10 +8,10 @@ import (
 )
 
 //go:embed migrations/*.sql
-var migrations embed.FS
+var sqliteMigrations embed.FS
 
 func Migrate(database *sqlx.DB) error {
-	goose.SetBaseFS(migrations)
+	goose.SetBaseFS(sqliteMigrations)
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		return err
 	}

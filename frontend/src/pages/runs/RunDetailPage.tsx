@@ -145,6 +145,7 @@ const RunDetailPage: Component = () => {
 	// Project + pipeline names for breadcrumb
 	const [projectName, setProjectName] = createSignal('Project');
 	const [pipelineName, setPipelineName] = createSignal('Pipeline');
+	const [pipelineActive, setPipelineActive] = createSignal(true);
 
 	onMount(async () => {
 		try {
@@ -154,6 +155,7 @@ const RunDetailPage: Component = () => {
 			]);
 			setProjectName(project.name);
 			setPipelineName(pipeline.name);
+			setPipelineActive(Boolean(pipeline.is_active));
 		} catch { /* fallback */ }
 	});
 
@@ -398,7 +400,7 @@ const RunDetailPage: Component = () => {
 							<Button size="sm" onClick={handleApprove} loading={approving()}>Approve</Button>
 						</Show>
 						<Show when={run()!.status === 'failure' || run()!.status === 'cancelled'}>
-							<Button size="sm" variant="outline" onClick={handleRerun} loading={rerunning()}>Rerun</Button>
+							<Button size="sm" variant="outline" onClick={handleRerun} loading={rerunning()} disabled={!pipelineActive()} title={!pipelineActive() ? 'Pipeline is disabled' : 'Rerun this pipeline'}>Rerun</Button>
 						</Show>
 					</Show>
 					<Button size="sm" variant="ghost" onClick={() => setShowArtifacts(!showArtifacts())}>

@@ -32,6 +32,35 @@ interface BuilderStage {
   jobs: BuilderJob[];
 }
 
+// Trigger builder data model
+interface BuilderTriggers {
+  pushEnabled: boolean;
+  pushBranches: string[];
+  pushTags: string[];
+  pushPaths: string[];
+  pushIgnorePaths: string[];
+  prEnabled: boolean;
+  prTypes: string[];
+  prBranches: string[];
+  scheduleEnabled: boolean;
+  schedules: { cron: string; timezone: string; branch: string }[];
+  manualEnabled: boolean;
+}
+
+const defaultTriggers = (): BuilderTriggers => ({
+  pushEnabled: false,
+  pushBranches: [],
+  pushTags: [],
+  pushPaths: [],
+  pushIgnorePaths: [],
+  prEnabled: false,
+  prTypes: [],
+  prBranches: [],
+  scheduleEnabled: false,
+  schedules: [],
+  manualEnabled: false,
+});
+
 interface PipelineBuilderProps {
   initialYaml: string;
   projectId: string;
@@ -66,7 +95,12 @@ function mapToKv(m?: Record<string, string>): KeyValuePair[] {
 interface YamlSpec {
   version?: string;
   name?: string;
-  on?: unknown;
+  on?: {
+    push?: { branches?: string[]; tags?: string[]; paths?: string[]; ignore_paths?: string[] };
+    pull_request?: { types?: string[]; branches?: string[] };
+    schedule?: { cron: string; timezone?: string; branch?: string }[];
+    manual?: unknown;
+  };
   defaults?: unknown;
   env?: Record<string, string>;
   stages?: string[];
@@ -98,12 +132,40 @@ interface YamlStep {
   outputs?: string[];
 }
 
-function yamlToBuilder(yamlStr: string): { stages: BuilderStage[]; pipelineEnv: KeyValuePair[]; pipelineName: string; raw: YamlSpec } {
+function yamlToBuilder(yamlStr: string): { stages: BuilderStage[]; pipelineEnv: KeyValuePair[]; pipelineName: string; triggers: BuilderTriggers; raw: YamlSpec } {
   let spec: YamlSpec;
   try {
     spec = (yaml.load(yamlStr) as YamlSpec) || {};
   } catch {
     spec = {};
+  }
+
+  // Extract trigger config
+  const triggers = defaultTriggers();
+  if (spec.on) {
+    if (spec.on.push) {
+      triggers.pushEnabled = true;
+      triggers.pushBranches = spec.on.push.branches || [];
+      triggers.pushTags = spec.on.push.tags || [];
+      triggers.pushPaths = spec.on.push.paths || [];
+      triggers.pushIgnorePaths = spec.on.push.ignore_paths || [];
+    }
+    if (spec.on.pull_request) {
+      triggers.prEnabled = true;
+      triggers.prTypes = spec.on.pull_request.types || [];
+      triggers.prBranches = spec.on.pull_request.branches || [];
+    }
+    if (spec.on.schedule && spec.on.schedule.length > 0) {
+      triggers.scheduleEnabled = true;
+      triggers.schedules = spec.on.schedule.map((s) => ({
+        cron: s.cron || '',
+        timezone: s.timezone || '',
+        branch: s.branch || '',
+      }));
+    }
+    if (spec.on.manual !== undefined && spec.on.manual !== null) {
+      triggers.manualEnabled = true;
+    }
   }
 
   const jobs = spec.jobs || {};
@@ -155,17 +217,45 @@ function yamlToBuilder(yamlStr: string): { stages: BuilderStage[]; pipelineEnv: 
     stages,
     pipelineEnv: mapToKv(spec.env),
     pipelineName: spec.name || '',
+    triggers,
     raw: spec,
   };
 }
 
-function builderToYaml(stages: BuilderStage[], pipelineName: string, pipelineEnv: KeyValuePair[], rawSpec?: YamlSpec): string {
+function builderToYaml(stages: BuilderStage[], pipelineName: string, pipelineEnv: KeyValuePair[], triggers: BuilderTriggers, rawSpec?: YamlSpec): string {
   const spec: Record<string, unknown> = {};
   spec.version = rawSpec?.version || '1';
   spec.name = pipelineName || rawSpec?.name || 'pipeline';
 
-  // Preserve triggers if present
-  if (rawSpec?.on) spec.on = rawSpec.on;
+  // Build triggers from builder state
+  const onConfig: Record<string, unknown> = {};
+  if (triggers.pushEnabled) {
+    const push: Record<string, unknown> = {};
+    if (triggers.pushBranches.length > 0) push.branches = triggers.pushBranches;
+    if (triggers.pushTags.length > 0) push.tags = triggers.pushTags;
+    if (triggers.pushPaths.length > 0) push.paths = triggers.pushPaths;
+    if (triggers.pushIgnorePaths.length > 0) push.ignore_paths = triggers.pushIgnorePaths;
+    onConfig.push = push;
+  }
+  if (triggers.prEnabled) {
+    const pr: Record<string, unknown> = {};
+    if (triggers.prTypes.length > 0) pr.types = triggers.prTypes;
+    if (triggers.prBranches.length > 0) pr.branches = triggers.prBranches;
+    onConfig.pull_request = pr;
+  }
+  if (triggers.scheduleEnabled && triggers.schedules.length > 0) {
+    onConfig.schedule = triggers.schedules.map((s) => {
+      const entry: Record<string, string> = { cron: s.cron };
+      if (s.timezone) entry.timezone = s.timezone;
+      if (s.branch) entry.branch = s.branch;
+      return entry;
+    });
+  }
+  if (triggers.manualEnabled) {
+    onConfig.manual = {};
+  }
+  if (Object.keys(onConfig).length > 0) spec.on = onConfig;
+
   if (rawSpec?.defaults) spec.defaults = rawSpec.defaults;
 
   const envMap = kvToMap(pipelineEnv);
@@ -218,6 +308,59 @@ const COMMON_IMAGES = [
 ];
 
 // ---------------------------------------------------------------------------
+// TagInput — inline chip/tag input for pattern lists
+// ---------------------------------------------------------------------------
+const TagInput: Component<{ values: string[]; onChange: (v: string[]) => void; placeholder?: string }> = (props) => {
+  const [input, setInput] = createSignal('');
+
+  const addTag = () => {
+    const val = input().trim();
+    if (val && !props.values.includes(val)) {
+      props.onChange([...props.values, val]);
+      setInput('');
+    }
+  };
+
+  const removeTag = (tag: string) => {
+    props.onChange(props.values.filter((v) => v !== tag));
+  };
+
+  return (
+    <div class="flex flex-wrap items-center gap-1.5 p-1.5 rounded bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)] min-h-[34px]">
+      <For each={props.values}>
+        {(tag) => (
+          <span class="inline-flex items-center gap-1 text-xs font-mono px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/25">
+            {tag}
+            <button
+              type="button"
+              onClick={() => removeTag(tag)}
+              class="hover:text-red-400 transition-colors ml-0.5"
+            >
+              <svg class="w-3 h-3" viewBox="0 0 20 20" fill="currentColor"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" /></svg>
+            </button>
+          </span>
+        )}
+      </For>
+      <input
+        type="text"
+        value={input()}
+        onInput={(e) => setInput(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); addTag(); }
+          if (e.key === ',' && input().trim()) { e.preventDefault(); addTag(); }
+          if (e.key === 'Backspace' && !input() && props.values.length > 0) {
+            removeTag(props.values[props.values.length - 1]);
+          }
+        }}
+        onBlur={() => { if (input().trim()) addTag(); }}
+        class="flex-1 min-w-[120px] px-1 py-0.5 text-xs bg-transparent text-[var(--color-text-primary)] placeholder-[var(--color-text-tertiary)] border-none focus:outline-none"
+        placeholder={props.values.length === 0 ? props.placeholder : 'Add...'}
+      />
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // PipelineBuilder component
 // ---------------------------------------------------------------------------
 const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
@@ -230,9 +373,12 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
   const [yamlError, setYamlError] = createSignal('');
   const [collapsedJobs, setCollapsedJobs] = createSignal<Set<string>>(new Set());
   const [collapsedSteps, setCollapsedSteps] = createSignal<Set<string>>(new Set());
+  const [collapsedStages, setCollapsedStages] = createSignal<Set<string>>(new Set());
   const [showPipelineEnv, setShowPipelineEnv] = createSignal(false);
   const [showRefPanel, setShowRefPanel] = createSignal(false);
   const [showImageSuggestions, setShowImageSuggestions] = createSignal<string | null>(null);
+  const [showTriggers, setShowTriggers] = createSignal(false);
+  const [triggers, setTriggers] = createSignal<BuilderTriggers>(defaultTriggers());
   const [dirty, setDirty] = createSignal(false);
 
   // Fetch project env vars and secrets for reference
@@ -250,6 +396,7 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
       setStages(parsed.stages);
       setPipelineEnv(parsed.pipelineEnv);
       setPipelineName(parsed.pipelineName || props.pipelineName);
+      setTriggers(parsed.triggers);
       setRawSpec(parsed.raw);
     } else {
       setPipelineName(props.pipelineName);
@@ -257,7 +404,7 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
   });
 
   // Generate current YAML
-  const generateYaml = () => builderToYaml(stages(), pipelineName(), pipelineEnv(), rawSpec());
+  const generateYaml = () => builderToYaml(stages(), pipelineName(), pipelineEnv(), triggers(), rawSpec());
 
   // Mark dirty on any state change
   const markDirty = () => setDirty(true);
@@ -389,6 +536,12 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
     setCollapsedSteps(s);
   };
 
+  const toggleStage = (stageId: string) => {
+    const s = new Set(collapsedStages());
+    if (s.has(stageId)) s.delete(stageId); else s.add(stageId);
+    setCollapsedStages(s);
+  };
+
   // Switch to YAML view
   const switchToYaml = () => {
     setYamlEditContent(generateYaml());
@@ -404,6 +557,7 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
         setStages(parsed.stages);
         setPipelineEnv(parsed.pipelineEnv);
         if (parsed.pipelineName) setPipelineName(parsed.pipelineName);
+        setTriggers(parsed.triggers);
         setRawSpec(parsed.raw);
         setYamlError('');
       } catch (e) {
@@ -490,6 +644,278 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
 
       {/* Builder View */}
       <Show when={viewMode() === 'builder'}>
+        {/* Triggers section */}
+        <div class="rounded-xl border border-[var(--color-border-primary)] bg-[var(--color-bg-secondary)]">
+          <button
+            type="button"
+            class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors"
+            onClick={() => setShowTriggers(!showTriggers())}
+          >
+            <span class="flex items-center gap-2">
+              <svg class={`w-4 h-4 transition-transform ${showTriggers() ? 'rotate-90' : ''}`} viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd" /></svg>
+              Triggers
+              <Show when={triggers().pushEnabled || triggers().prEnabled || triggers().scheduleEnabled || triggers().manualEnabled}>
+                <span class="text-xs px-1.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-400">
+                  {[triggers().pushEnabled, triggers().prEnabled, triggers().scheduleEnabled, triggers().manualEnabled].filter(Boolean).length} active
+                </span>
+              </Show>
+            </span>
+            <span class="text-xs text-[var(--color-text-tertiary)]">Configure when this pipeline runs</span>
+          </button>
+          <Show when={showTriggers()}>
+            <div class="px-4 pb-4 border-t border-[var(--color-border-primary)] pt-3 space-y-4">
+              {/* Push Trigger */}
+              <div class="rounded-lg border border-[var(--color-border-primary)] bg-[var(--color-bg-primary)] overflow-hidden">
+                <label class="flex items-center justify-between px-3 py-2.5 cursor-pointer hover:bg-[var(--color-bg-hover)] transition-colors">
+                  <span class="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)]">
+                    <svg class="w-4 h-4 text-green-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm.75-11.25a.75.75 0 00-1.5 0v2.5h-2.5a.75.75 0 000 1.5h2.5v2.5a.75.75 0 001.5 0v-2.5h2.5a.75.75 0 000-1.5h-2.5v-2.5z" clip-rule="evenodd" /></svg>
+                    Push
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={triggers().pushEnabled}
+                    onChange={(e) => { setTriggers({ ...triggers(), pushEnabled: e.currentTarget.checked }); markDirty(); }}
+                    class="w-4 h-4 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-[var(--color-bg-tertiary)]"
+                  />
+                </label>
+                <Show when={triggers().pushEnabled}>
+                  <div class="px-3 pb-3 space-y-3 border-t border-[var(--color-border-primary)] pt-3">
+                    {/* Branches */}
+                    <div>
+                      <label class="text-xs font-medium text-[var(--color-text-secondary)] mb-1 block">Branch Patterns</label>
+                      <TagInput
+                        values={triggers().pushBranches}
+                        onChange={(v) => { setTriggers({ ...triggers(), pushBranches: v }); markDirty(); }}
+                        placeholder="e.g. main, develop, feature/**"
+                      />
+                    </div>
+                    {/* Tags */}
+                    <div>
+                      <label class="text-xs font-medium text-[var(--color-text-secondary)] mb-1 block">Tag Patterns</label>
+                      <TagInput
+                        values={triggers().pushTags}
+                        onChange={(v) => { setTriggers({ ...triggers(), pushTags: v }); markDirty(); }}
+                        placeholder="e.g. v*, release-*"
+                      />
+                    </div>
+                    {/* Paths */}
+                    <div>
+                      <label class="text-xs font-medium text-[var(--color-text-secondary)] mb-1 block">Path Filters <span class="text-[var(--color-text-tertiary)] font-normal">(only trigger for changes in these paths)</span></label>
+                      <TagInput
+                        values={triggers().pushPaths}
+                        onChange={(v) => { setTriggers({ ...triggers(), pushPaths: v }); markDirty(); }}
+                        placeholder="e.g. src/**, backend/**"
+                      />
+                    </div>
+                    {/* Ignore Paths */}
+                    <div>
+                      <label class="text-xs font-medium text-[var(--color-text-secondary)] mb-1 block">Ignore Paths <span class="text-[var(--color-text-tertiary)] font-normal">(skip trigger if only these paths change)</span></label>
+                      <TagInput
+                        values={triggers().pushIgnorePaths}
+                        onChange={(v) => { setTriggers({ ...triggers(), pushIgnorePaths: v }); markDirty(); }}
+                        placeholder="e.g. docs/**, *.md"
+                      />
+                    </div>
+                  </div>
+                </Show>
+              </div>
+
+              {/* Pull Request Trigger */}
+              <div class="rounded-lg border border-[var(--color-border-primary)] bg-[var(--color-bg-primary)] overflow-hidden">
+                <label class="flex items-center justify-between px-3 py-2.5 cursor-pointer hover:bg-[var(--color-bg-hover)] transition-colors">
+                  <span class="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)]">
+                    <svg class="w-4 h-4 text-blue-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M15 10a.75.75 0 01-.75.75H7.612l2.158 1.96a.75.75 0 11-1.04 1.08l-3.5-3.25a.75.75 0 010-1.08l3.5-3.25a.75.75 0 111.04 1.08L7.612 9.25h6.638A.75.75 0 0115 10z" clip-rule="evenodd" /></svg>
+                    Pull Request
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={triggers().prEnabled}
+                    onChange={(e) => { setTriggers({ ...triggers(), prEnabled: e.currentTarget.checked }); markDirty(); }}
+                    class="w-4 h-4 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-[var(--color-bg-tertiary)]"
+                  />
+                </label>
+                <Show when={triggers().prEnabled}>
+                  <div class="px-3 pb-3 space-y-3 border-t border-[var(--color-border-primary)] pt-3">
+                    {/* PR Event Types */}
+                    <div>
+                      <label class="text-xs font-medium text-[var(--color-text-secondary)] mb-2 block">Event Types</label>
+                      <div class="flex flex-wrap gap-2">
+                        <For each={['opened', 'synchronize', 'reopened', 'closed']}>
+                          {(type) => (
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={triggers().prTypes.includes(type)}
+                                onChange={(e) => {
+                                  const types = e.currentTarget.checked
+                                    ? [...triggers().prTypes, type]
+                                    : triggers().prTypes.filter((t) => t !== type);
+                                  setTriggers({ ...triggers(), prTypes: types });
+                                  markDirty();
+                                }}
+                                class="w-3.5 h-3.5 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-[var(--color-bg-tertiary)]"
+                              />
+                              <span class="text-xs text-[var(--color-text-secondary)]">{type}</span>
+                            </label>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                    {/* Target Branches */}
+                    <div>
+                      <label class="text-xs font-medium text-[var(--color-text-secondary)] mb-1 block">Target Branch Patterns</label>
+                      <TagInput
+                        values={triggers().prBranches}
+                        onChange={(v) => { setTriggers({ ...triggers(), prBranches: v }); markDirty(); }}
+                        placeholder="e.g. main, develop"
+                      />
+                    </div>
+                  </div>
+                </Show>
+              </div>
+
+              {/* Schedule Trigger */}
+              <div class="rounded-lg border border-[var(--color-border-primary)] bg-[var(--color-bg-primary)] overflow-hidden">
+                <label class="flex items-center justify-between px-3 py-2.5 cursor-pointer hover:bg-[var(--color-bg-hover)] transition-colors">
+                  <span class="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)]">
+                    <svg class="w-4 h-4 text-yellow-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm.75-13a.75.75 0 00-1.5 0v5c0 .414.336.75.75.75h4a.75.75 0 000-1.5h-3.25V5z" clip-rule="evenodd" /></svg>
+                    Schedule
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={triggers().scheduleEnabled}
+                    onChange={(e) => {
+                      const enabled = e.currentTarget.checked;
+                      const t = { ...triggers(), scheduleEnabled: enabled };
+                      if (enabled && t.schedules.length === 0) {
+                        t.schedules = [{ cron: '0 0 * * *', timezone: '', branch: 'main' }];
+                      }
+                      setTriggers(t);
+                      markDirty();
+                    }}
+                    class="w-4 h-4 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-[var(--color-bg-tertiary)]"
+                  />
+                </label>
+                <Show when={triggers().scheduleEnabled}>
+                  <div class="px-3 pb-3 space-y-2 border-t border-[var(--color-border-primary)] pt-3">
+                    <For each={triggers().schedules}>
+                      {(sched, idx) => (
+                        <div class="flex items-start gap-2 p-2 rounded bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)]">
+                          <div class="flex-1 space-y-2">
+                            <div class="flex gap-2">
+                              <div class="flex-1">
+                                <label class="text-xs text-[var(--color-text-tertiary)] block mb-0.5">Cron Expression</label>
+                                <input
+                                  type="text"
+                                  value={sched.cron}
+                                  onInput={(e) => {
+                                    const scheds = [...triggers().schedules];
+                                    scheds[idx()] = { ...scheds[idx()], cron: e.currentTarget.value };
+                                    setTriggers({ ...triggers(), schedules: scheds });
+                                    markDirty();
+                                  }}
+                                  class="w-full px-2 py-1 text-xs font-mono rounded bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] text-[var(--color-text-primary)] focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/30"
+                                  placeholder="0 0 * * *"
+                                />
+                              </div>
+                              <div class="w-32">
+                                <label class="text-xs text-[var(--color-text-tertiary)] block mb-0.5">Branch</label>
+                                <input
+                                  type="text"
+                                  value={sched.branch}
+                                  onInput={(e) => {
+                                    const scheds = [...triggers().schedules];
+                                    scheds[idx()] = { ...scheds[idx()], branch: e.currentTarget.value };
+                                    setTriggers({ ...triggers(), schedules: scheds });
+                                    markDirty();
+                                  }}
+                                  class="w-full px-2 py-1 text-xs rounded bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] text-[var(--color-text-primary)] focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/30"
+                                  placeholder="main"
+                                />
+                              </div>
+                            </div>
+                            <div class="flex flex-wrap gap-1.5">
+                              <For each={[
+                                { label: 'Hourly', cron: '0 * * * *' },
+                                { label: 'Daily midnight', cron: '0 0 * * *' },
+                                { label: 'Daily 9am', cron: '0 9 * * *' },
+                                { label: 'Weekly', cron: '0 0 * * 0' },
+                              ]}>
+                                {(preset) => (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const scheds = [...triggers().schedules];
+                                      scheds[idx()] = { ...scheds[idx()], cron: preset.cron };
+                                      setTriggers({ ...triggers(), schedules: scheds });
+                                      markDirty();
+                                    }}
+                                    class={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
+                                      sched.cron === preset.cron
+                                        ? 'bg-indigo-500/20 border-indigo-500/30 text-indigo-400'
+                                        : 'border-[var(--color-border-primary)] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] hover:border-[var(--color-border-secondary)]'
+                                    }`}
+                                  >{preset.label}</button>
+                                )}
+                              </For>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const scheds = triggers().schedules.filter((_, i) => i !== idx());
+                              setTriggers({ ...triggers(), schedules: scheds });
+                              markDirty();
+                            }}
+                            class="mt-4 p-1 rounded text-[var(--color-text-tertiary)] hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                            title="Remove schedule"
+                          >
+                            <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5z" clip-rule="evenodd" /></svg>
+                          </button>
+                        </div>
+                      )}
+                    </For>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTriggers({ ...triggers(), schedules: [...triggers().schedules, { cron: '0 0 * * *', timezone: '', branch: 'main' }] });
+                        markDirty();
+                      }}
+                      class="text-xs text-indigo-400 hover:text-indigo-300 transition-colors flex items-center gap-1"
+                    >
+                      <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
+                      Add Schedule
+                    </button>
+                  </div>
+                </Show>
+              </div>
+
+              {/* Manual Trigger */}
+              <div class="rounded-lg border border-[var(--color-border-primary)] bg-[var(--color-bg-primary)] overflow-hidden">
+                <label class="flex items-center justify-between px-3 py-2.5 cursor-pointer hover:bg-[var(--color-bg-hover)] transition-colors">
+                  <span class="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)]">
+                    <svg class="w-4 h-4 text-purple-400" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" /></svg>
+                    Manual
+                    <span class="text-xs text-[var(--color-text-tertiary)] font-normal">— always available from UI</span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={triggers().manualEnabled}
+                    onChange={(e) => { setTriggers({ ...triggers(), manualEnabled: e.currentTarget.checked }); markDirty(); }}
+                    class="w-4 h-4 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-[var(--color-bg-tertiary)]"
+                  />
+                </label>
+              </div>
+
+              <Show when={!triggers().pushEnabled && !triggers().prEnabled && !triggers().scheduleEnabled && !triggers().manualEnabled}>
+                <p class="text-xs text-[var(--color-text-tertiary)] text-center py-1">
+                  No triggers configured — pipeline will trigger on all events.
+                </p>
+              </Show>
+            </div>
+          </Show>
+        </div>
+
         {/* Pipeline-level env vars toggle */}
         <div class="rounded-xl border border-[var(--color-border-primary)] bg-[var(--color-bg-secondary)]">
           <button
@@ -517,55 +943,104 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
           </Show>
         </div>
 
-        {/* Stages */}
-        <For each={stages()}>
-          {(stage, stageIdx) => (
-            <div class="rounded-xl border border-[var(--color-border-primary)] bg-[var(--color-bg-secondary)] overflow-hidden">
-              {/* Stage header */}
-              <div class="flex items-center gap-3 px-4 py-3 bg-[var(--color-bg-tertiary)] border-b border-[var(--color-border-primary)]">
-                <div class="flex items-center gap-1.5">
-                  <span class="text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)]">Stage</span>
-                  <span class="text-xs px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 font-mono">{stageIdx() + 1}</span>
-                </div>
-                <input
-                  type="text"
-                  value={stage.name}
-                  onInput={(e) => renameStageName(stage.id, e.currentTarget.value)}
-                  class="flex-1 px-2 py-1 text-sm font-medium font-mono bg-transparent border border-transparent hover:border-[var(--color-border-primary)] focus:border-indigo-500/50 rounded text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-indigo-500/30 transition-colors"
-                />
-                <div class="flex items-center gap-1">
-                  <button
-                    type="button"
-                    disabled={stageIdx() === 0}
-                    onClick={() => moveStage(stage.id, -1)}
-                    class="p-1 rounded text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                    title="Move up"
-                  >
-                    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 9.168l-3.71 3.602a.75.75 0 01-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01-.02 1.06z" clip-rule="evenodd" /></svg>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={stageIdx() === stages().length - 1}
-                    onClick={() => moveStage(stage.id, 1)}
-                    class="p-1 rounded text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                    title="Move down"
-                  >
-                    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.832l3.71-3.602a.75.75 0 011.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd" /></svg>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeStage(stage.id)}
-                    class="p-1 rounded text-[var(--color-text-tertiary)] hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                    title="Remove stage"
-                  >
-                    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" /></svg>
-                  </button>
-                </div>
-              </div>
+        {/* Stages block */}
+        <div class="rounded-xl border border-[var(--color-border-primary)] bg-[var(--color-bg-secondary)] overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-3 bg-[var(--color-bg-tertiary)] border-b border-[var(--color-border-primary)]">
+            <span class="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)]">
+              <svg class="w-4 h-4 text-indigo-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M2 4.75A.75.75 0 012.75 4h14.5a.75.75 0 010 1.5H2.75A.75.75 0 012 4.75zm0 10.5a.75.75 0 01.75-.75h7.5a.75.75 0 010 1.5h-7.5a.75.75 0 01-.75-.75zM2 10a.75.75 0 01.75-.75h14.5a.75.75 0 010 1.5H2.75A.75.75 0 012 10z" clip-rule="evenodd" /></svg>
+              Stages
+              <Show when={stages().length > 0}>
+                <span class="text-xs px-1.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-400">{stages().length}</span>
+              </Show>
+            </span>
+            <button
+              type="button"
+              onClick={addStage}
+              class="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg transition-colors"
+            >
+              <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
+              Add Stage
+            </button>
+          </div>
 
-              {/* Jobs */}
-              <div class="p-4 space-y-4">
-                <For each={stage.jobs}>
+          <div class="p-4 space-y-3">
+            <Show when={stages().length === 0}>
+              <div class="text-center py-6">
+                <p class="text-sm text-[var(--color-text-tertiary)] mb-2">No stages defined yet.</p>
+                <button
+                  type="button"
+                  onClick={addStage}
+                  class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-400 hover:text-indigo-300 border border-dashed border-indigo-500/30 hover:border-indigo-500/50 rounded-lg hover:bg-indigo-500/5 transition-colors"
+                >
+                  <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
+                  Add your first stage
+                </button>
+              </div>
+            </Show>
+
+            <For each={stages()}>
+              {(stage, stageIdx) => {
+                const isStageCollapsed = () => collapsedStages().has(stage.id);
+
+                return (
+                  <div class="rounded-lg border border-[var(--color-border-primary)] bg-[var(--color-bg-primary)] overflow-hidden">
+                    {/* Stage header — clickable to collapse */}
+                    <div class="flex items-center gap-2 px-3 py-2.5 bg-[var(--color-bg-secondary)] border-b border-[var(--color-border-primary)]">
+                      <button
+                        type="button"
+                        onClick={() => toggleStage(stage.id)}
+                        class="p-0.5 rounded text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] transition-colors"
+                      >
+                        <svg class={`w-4 h-4 transition-transform ${isStageCollapsed() ? '' : 'rotate-90'}`} viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd" /></svg>
+                      </button>
+                      <span class="text-xs px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 font-mono">{stageIdx() + 1}</span>
+                      <input
+                        type="text"
+                        value={stage.name}
+                        onInput={(e) => renameStageName(stage.id, e.currentTarget.value)}
+                        class="flex-1 px-2 py-0.5 text-sm font-medium font-mono bg-transparent border border-transparent hover:border-[var(--color-border-primary)] focus:border-indigo-500/50 rounded text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-indigo-500/30 transition-colors"
+                      />
+                      <Show when={isStageCollapsed()}>
+                        <span class="text-xs text-[var(--color-text-tertiary)]">
+                          {stage.jobs.length} job{stage.jobs.length !== 1 ? 's' : ''}
+                          {stage.jobs.reduce((sum, j) => sum + j.steps.length, 0) > 0 && `, ${stage.jobs.reduce((sum, j) => sum + j.steps.length, 0)} steps`}
+                        </span>
+                      </Show>
+                      <div class="flex items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={stageIdx() === 0}
+                          onClick={() => moveStage(stage.id, -1)}
+                          class="p-1 rounded text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                          title="Move up"
+                        >
+                          <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 9.168l-3.71 3.602a.75.75 0 01-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01-.02 1.06z" clip-rule="evenodd" /></svg>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={stageIdx() === stages().length - 1}
+                          onClick={() => moveStage(stage.id, 1)}
+                          class="p-1 rounded text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                          title="Move down"
+                        >
+                          <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.832l3.71-3.602a.75.75 0 011.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd" /></svg>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeStage(stage.id)}
+                          class="p-1 rounded text-[var(--color-text-tertiary)] hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                          title="Remove stage"
+                        >
+                          <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" /></svg>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Stage content — collapsible */}
+                    <Show when={!isStageCollapsed()}>
+                      {/* Jobs */}
+                      <div class="p-4 space-y-4">
+                        <For each={stage.jobs}>
                   {(job) => {
                     const isCollapsed = () => collapsedJobs().has(job.id);
                     const jobEnvCount = () => job.env.filter((e) => e.key.trim()).length;
@@ -829,19 +1304,13 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
                   Add Job
                 </button>
               </div>
-            </div>
-          )}
-        </For>
-
-        {/* Add Stage button */}
-        <button
-          type="button"
-          onClick={addStage}
-          class="w-full flex items-center justify-center gap-2 py-3 text-sm font-medium text-[var(--color-text-secondary)] border-2 border-dashed border-[var(--color-border-primary)] rounded-xl hover:border-indigo-500/50 hover:text-indigo-400 hover:bg-indigo-500/5 transition-colors"
-        >
-          <svg class="w-5 h-5" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
-          Add Stage
-        </button>
+                    </Show>
+                  </div>
+                );
+              }}
+            </For>
+          </div>
+        </div>
 
         {/* Project variables & secrets reference panel */}
         <div class="rounded-xl border border-[var(--color-border-primary)] bg-[var(--color-bg-secondary)]">

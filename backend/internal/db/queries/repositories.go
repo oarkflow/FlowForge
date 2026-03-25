@@ -16,6 +16,19 @@ type Repositories struct {
 	Notifications *NotificationRepo
 	AuditLogs     *AuditLogRepo
 	EnvVars       *EnvVarRepo
+	Environments  *EnvironmentRepo
+	Deployments   *DeploymentRepo
+	EnvOverrides      *EnvOverrideRepo
+	Registries        *RegistryRepo
+	Approvals         *ApprovalRepo
+	ApprovalResponses *ApprovalResponseRepo
+	Schedules         *ScheduleRepo
+	ScalingPolicies      *ScalingPolicyRepo
+	ScalingEvents        *ScalingEventRepo
+	PipelineLinks        *PipelineLinkRepo
+	InAppNotifications   *InAppNotificationRepo
+	NotificationPrefs    *NotificationPrefRepo
+	DashboardPrefs       *DashboardPrefRepo
 }
 
 func NewRepositories(db *sqlx.DB) *Repositories {
@@ -33,5 +46,18 @@ func NewRepositories(db *sqlx.DB) *Repositories {
 		Notifications: &NotificationRepo{db: db},
 		AuditLogs:     &AuditLogRepo{db: db},
 		EnvVars:       NewEnvVarRepo(db),
+		Environments:  &EnvironmentRepo{db: db},
+		Deployments:   &DeploymentRepo{db: db},
+		EnvOverrides:      &EnvOverrideRepo{db: db},
+		Registries:        &RegistryRepo{db: db},
+		Approvals:         &ApprovalRepo{db: db},
+		ApprovalResponses: &ApprovalResponseRepo{db: db},
+		Schedules:         &ScheduleRepo{db: db},
+		ScalingPolicies:      &ScalingPolicyRepo{db: db},
+		ScalingEvents:        &ScalingEventRepo{db: db},
+		PipelineLinks:        &PipelineLinkRepo{db: db},
+		InAppNotifications:   &InAppNotificationRepo{db: db},
+		NotificationPrefs:    &NotificationPrefRepo{db: db},
+		DashboardPrefs:       &DashboardPrefRepo{db: db},
 	}
 }

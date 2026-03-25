@@ -14,6 +14,7 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/engine/executor"
 	"github.com/oarkflow/deploy/backend/internal/engine/scheduler"
 	"github.com/oarkflow/deploy/backend/internal/models"
+	"github.com/oarkflow/deploy/backend/internal/pipeline"
 	"github.com/oarkflow/deploy/backend/internal/websocket"
 )
 
@@ -44,7 +45,8 @@ type preCreatedIDs struct {
 
 // RunPipeline executes the pipeline run described by the given config.
 // It pre-creates all stage/job/step records as "pending" so the UI can display
-// the full tree immediately, then executes stages sequentially.
+// the full tree immediately, then executes stages — either sequentially or in
+// parallel via DAG-based level grouping when stages declare `needs` dependencies.
 func (r *Runner) RunPipeline(ctx context.Context, runID string, config scheduler.PipelineConfig) error {
 	// Pre-create all stage, job, and step records with "pending" status
 	ids, err := r.preCreateRecords(ctx, runID, config)
@@ -68,10 +70,32 @@ func (r *Runner) RunPipeline(ctx context.Context, runID string, config scheduler
 		r.broadcastLog(runID, "", "system", fmt.Sprintf("Created workspace volume: %s\n", volumeName))
 	}
 
-	// Execute stages sequentially
+	// Check if any stage has Needs defined — if so, use DAG-based execution
+	hasNeeds := false
+	depsMap := make(map[string][]string, len(config.Stages))
+	stageNames := make([]string, len(config.Stages))
+	stageByName := make(map[string]int, len(config.Stages))
+	for i, stageCfg := range config.Stages {
+		stageNames[i] = stageCfg.Name
+		stageByName[stageCfg.Name] = i
+		if len(stageCfg.Needs) > 0 {
+			hasNeeds = true
+			depsMap[stageCfg.Name] = stageCfg.Needs
+		}
+	}
+
+	if hasNeeds {
+		return r.runStagesDAG(ctx, runID, config, ids, depsMap, stageNames, stageByName, volumeName)
+	}
+
+	// Fallback: sequential execution (backward compatibility)
+	return r.runStagesSequential(ctx, runID, config, ids, volumeName)
+}
+
+// runStagesSequential executes stages one by one in order (original behavior).
+func (r *Runner) runStagesSequential(ctx context.Context, runID string, config scheduler.PipelineConfig, ids *preCreatedIDs, volumeName string) error {
 	for i, stageCfg := range config.Stages {
 		if err := ctx.Err(); err != nil {
-			// Mark remaining stages as cancelled
 			for j := i; j < len(config.Stages); j++ {
 				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[j], "cancelled")
 				r.broadcastStatusChange(runID, "stage", ids.stageIDs[j], config.Stages[j].Name, "cancelled")
@@ -80,7 +104,6 @@ func (r *Runner) RunPipeline(ctx context.Context, runID string, config scheduler
 		}
 
 		if err := r.runStage(ctx, runID, ids.stageIDs[i], stageCfg, ids.jobIDs[i], ids.stepIDs[i], volumeName); err != nil {
-			// Mark remaining stages as skipped
 			for j := i + 1; j < len(config.Stages); j++ {
 				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[j], "skipped")
 				r.broadcastStatusChange(runID, "stage", ids.stageIDs[j], config.Stages[j].Name, "skipped")
@@ -88,6 +111,96 @@ func (r *Runner) RunPipeline(ctx context.Context, runID string, config scheduler
 			return fmt.Errorf("stage %q failed: %w", stageCfg.Name, err)
 		}
 	}
+	return nil
+}
+
+// runStagesDAG executes stages grouped by DAG levels. Stages within the same
+// level run concurrently; stages at higher levels wait for their dependencies.
+func (r *Runner) runStagesDAG(ctx context.Context, runID string, config scheduler.PipelineConfig, ids *preCreatedIDs, depsMap map[string][]string, stageNames []string, stageByName map[string]int, volumeName string) error {
+	dag, err := pipeline.BuildStageDAG(stageNames, depsMap)
+	if err != nil {
+		return fmt.Errorf("invalid stage DAG: %w", err)
+	}
+
+	r.broadcastLog(runID, "", "system", fmt.Sprintf("DAG execution: %d levels detected\n", len(dag.Levels)))
+
+	// Track which stages failed so we can skip dependents
+	failedStages := make(map[string]bool)
+	var failedMu sync.Mutex
+
+	for levelIdx, level := range dag.Levels {
+		if err := ctx.Err(); err != nil {
+			// Cancel all remaining stages
+			for li := levelIdx; li < len(dag.Levels); li++ {
+				for _, stageName := range dag.Levels[li] {
+					idx := stageByName[stageName]
+					r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[idx], "cancelled")
+					r.broadcastStatusChange(runID, "stage", ids.stageIDs[idx], stageName, "cancelled")
+				}
+			}
+			return fmt.Errorf("pipeline cancelled: %w", err)
+		}
+
+		r.broadcastLog(runID, "", "system", fmt.Sprintf("=== DAG Level %d: [%s] ===\n", levelIdx, strings.Join(level, ", ")))
+
+		var wg sync.WaitGroup
+		var levelErrs []error
+		var errMu sync.Mutex
+
+		for _, stageName := range level {
+			stageIdx := stageByName[stageName]
+
+			// Check if any dependency failed → skip this stage
+			shouldSkip := false
+			failedMu.Lock()
+			for _, dep := range depsMap[stageName] {
+				if failedStages[dep] {
+					shouldSkip = true
+					break
+				}
+			}
+			failedMu.Unlock()
+
+			if shouldSkip {
+				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[stageIdx], "skipped")
+				r.broadcastStatusChange(runID, "stage", ids.stageIDs[stageIdx], stageName, "skipped")
+				r.broadcastLog(runID, "", "system", fmt.Sprintf("Stage %q skipped (dependency failed)\n", stageName))
+				failedMu.Lock()
+				failedStages[stageName] = true
+				failedMu.Unlock()
+				continue
+			}
+
+			wg.Add(1)
+			go func(name string, idx int) {
+				defer wg.Done()
+				stageCfg := config.Stages[idx]
+				if stageErr := r.runStage(ctx, runID, ids.stageIDs[idx], stageCfg, ids.jobIDs[idx], ids.stepIDs[idx], volumeName); stageErr != nil {
+					errMu.Lock()
+					levelErrs = append(levelErrs, fmt.Errorf("stage %q failed: %w", name, stageErr))
+					errMu.Unlock()
+					failedMu.Lock()
+					failedStages[name] = true
+					failedMu.Unlock()
+				}
+			}(stageName, stageIdx)
+		}
+
+		wg.Wait()
+
+		// If all stages in this level failed, we can still continue —
+		// dependents will be skipped. Only return error at the very end.
+	}
+
+	// Check if any stage failed
+	if len(failedStages) > 0 {
+		var names []string
+		for name := range failedStages {
+			names = append(names, name)
+		}
+		return fmt.Errorf("stages failed: %s", strings.Join(names, ", "))
+	}
+
 	return nil
 }
 

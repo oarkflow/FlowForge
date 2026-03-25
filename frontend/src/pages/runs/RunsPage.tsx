@@ -51,6 +51,7 @@ async function fetchAllRuns(): Promise<RunWithMeta[]> {
               pipeline_name: pipeline.name,
               project_id: project.id,
               project_name: project.name,
+              pipeline_is_active: Boolean(pipeline.is_active),
             });
           }
         } catch { /* pipeline may have no runs */ }
@@ -267,9 +268,10 @@ const RunsPage: Component = () => {
           </Show>
           <Show when={row.status === 'failure' || row.status === 'cancelled'}>
             <button
-              class="px-2 py-1 text-xs rounded bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 transition-colors cursor-pointer"
+              class="px-2 py-1 text-xs rounded bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/10"
               onClick={(e) => handleRerun(e, row)}
-              disabled={rerunningId() === row.id}
+              disabled={rerunningId() === row.id || !row.pipeline_is_active}
+              title={!row.pipeline_is_active ? 'Pipeline is disabled' : 'Rerun'}
             >
               {rerunningId() === row.id ? '...' : 'Rerun'}
             </button>

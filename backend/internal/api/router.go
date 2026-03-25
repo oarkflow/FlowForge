@@ -38,6 +38,9 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	// Global runs (all pipelines/projects)
 	protected.Get("/runs", h.ListAllRuns)
 
+	// Recent deployments (for dashboard)
+	protected.Get("/deployments/recent", h.ListRecentDeployments)
+
 	// Import wizard
 	importGroup := protected.Group("/import")
 	importGroup.Post("/detect", h.ImportDetect)
@@ -120,6 +123,47 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	notifs.Put("/:nid", middleware.RequireAdmin(), h.UpdateNotificationChannel)
 	notifs.Delete("/:nid", middleware.RequireAdmin(), h.DeleteNotificationChannel)
 
+	// Environments
+	environments := projects.Group("/:id/environments")
+	environments.Get("/", h.ListEnvironments)
+	environments.Post("/", middleware.RequireDev(), h.CreateEnvironment)
+	environments.Put("/:eid", middleware.RequireDev(), h.UpdateEnvironment)
+	environments.Delete("/:eid", middleware.RequireAdmin(), h.DeleteEnvironment)
+	environments.Post("/:eid/lock", middleware.RequireDev(), h.LockEnvironment)
+	environments.Post("/:eid/unlock", middleware.RequireDev(), h.UnlockEnvironment)
+
+	// Deployments
+	environments.Get("/:eid/deployments", h.ListDeployments)
+	environments.Post("/:eid/deploy", middleware.RequireDev(), h.TriggerDeployment)
+	environments.Post("/:eid/rollback", middleware.RequireDev(), h.RollbackDeployment)
+	environments.Post("/:eid/promote", middleware.RequireDev(), h.PromoteDeployment)
+
+	// Deployment Strategy
+	environments.Get("/:eid/strategy", middleware.RequireDev(), h.GetStrategyConfig)
+	environments.Put("/:eid/strategy", middleware.RequireDev(), h.UpdateStrategyConfig)
+	environments.Post("/:eid/deployments/:did/advance-canary", middleware.RequireDev(), h.AdvanceCanary)
+	environments.Get("/:eid/deployments/:did/health", h.CheckDeploymentHealth)
+	environments.Get("/:eid/deployments/:did/plan", h.GetDeploymentPlan)
+
+	// Environment Overrides
+	environments.Get("/:eid/overrides", middleware.RequireDev(), h.ListEnvOverrides)
+	environments.Put("/:eid/overrides", middleware.RequireDev(), h.SaveEnvOverrides)
+
+	// Environment Protection Rules
+	environments.Put("/:eid/protection", middleware.RequireAdmin(), h.UpdateProtectionRules)
+
+	// Registries
+	registries := projects.Group("/:id/registries")
+	registries.Get("/", h.ListRegistries)
+	registries.Post("/", middleware.RequireDev(), h.CreateRegistry)
+	registries.Put("/:rid", middleware.RequireDev(), h.UpdateRegistry)
+	registries.Delete("/:rid", middleware.RequireAdmin(), h.DeleteRegistry)
+	registries.Post("/:rid/test", middleware.RequireDev(), h.TestRegistry)
+	registries.Get("/:rid/images", h.ListRegistryImages)
+	registries.Get("/:rid/images/:name/tags", h.ListRegistryTags)
+	registries.Delete("/:rid/images/:name/tags/:tag", middleware.RequireDev(), h.DeleteRegistryTag)
+	registries.Post("/:rid/default", middleware.RequireDev(), h.SetDefaultRegistry)
+
 	// Agents
 	agents := protected.Group("/agents")
 	agents.Get("/", h.ListAgents)
@@ -136,11 +180,86 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	// Audit logs
 	protected.Get("/audit-logs", middleware.RequireAdmin(), h.ListAuditLogs)
 
+	// Approvals
+	approvals := protected.Group("/approvals")
+	approvals.Get("/pending", h.ListPendingApprovals)
+	approvals.Get("/:aid", h.GetApproval)
+	approvals.Post("/:aid/approve", h.ApproveApproval)
+	approvals.Post("/:aid/reject", h.RejectApproval)
+	approvals.Post("/:aid/cancel", h.CancelApproval)
+	approvals.Get("/:aid/responses", h.GetApprovalResponses)
+
+	// Project Approvals
+	projects.Get("/:id/approvals", h.ListProjectApprovals)
+
+	// Project Schedules
+	projects.Get("/:id/schedules", h.ListProjectSchedules)
+
+	// Pipeline Schedules (top-level pipeline routes for schedule management)
+	pipelineSchedules := protected.Group("/pipelines")
+	pipelineSchedules.Get("/:id/schedules", h.ListPipelineSchedules)
+	pipelineSchedules.Post("/:id/schedules", middleware.RequireDev(), h.CreateSchedule)
+
+	// Pipeline Links (composition) and DAG
+	pipelineSchedules.Get("/:id/links", h.ListPipelineLinks)
+	pipelineSchedules.Post("/:id/links", middleware.RequireDev(), h.CreatePipelineLink)
+	pipelineSchedules.Get("/:id/dag", h.GetPipelineDAG)
+
+	// Pipeline Link operations (standalone by link ID)
+	pipelineLinksOps := protected.Group("/pipeline-links")
+	pipelineLinksOps.Put("/:lid", middleware.RequireDev(), h.UpdatePipelineLink)
+	pipelineLinksOps.Delete("/:lid", middleware.RequireAdmin(), h.DeletePipelineLink)
+
+	// Schedule operations (standalone by schedule ID)
+	schedules := protected.Group("/schedules")
+	schedules.Put("/:sid", middleware.RequireDev(), h.UpdateSchedule)
+	schedules.Delete("/:sid", middleware.RequireAdmin(), h.DeleteSchedule)
+	schedules.Post("/:sid/enable", middleware.RequireDev(), h.EnableSchedule)
+	schedules.Post("/:sid/disable", middleware.RequireDev(), h.DisableSchedule)
+	schedules.Get("/:sid/next-runs", h.GetNextRuns)
+
+	// Global search
+	protected.Get("/search", h.GlobalSearch)
+
+	// Notification Inbox (in-app notifications)
+	inbox := protected.Group("/notifications/inbox")
+	inbox.Get("/", h.ListInAppNotifications)
+	inbox.Get("/unread-count", h.CountUnreadNotifications)
+	inbox.Post("/read-all", h.MarkAllNotificationsRead)
+	inbox.Post("/:nid/read", h.MarkNotificationRead)
+	inbox.Delete("/:nid", h.DeleteNotification)
+
+	// Notification Preferences
+	notifPrefs := protected.Group("/notifications/preferences")
+	notifPrefs.Get("/", h.GetNotificationPreferences)
+	notifPrefs.Put("/", h.UpdateNotificationPreferences)
+
+	// Dashboard Preferences
+	dashPrefs := protected.Group("/dashboard/preferences")
+	dashPrefs.Get("/", h.GetDashboardPreferences)
+	dashPrefs.Put("/", h.UpdateDashboardPreferences)
+
+	// Auto-Scaling
+	scaling := protected.Group("/scaling")
+	scaling.Get("/policies", h.ListScalingPolicies)
+	scaling.Post("/policies", middleware.RequireAdmin(), h.CreateScalingPolicy)
+	scaling.Get("/policies/:pid", h.GetScalingPolicy)
+	scaling.Put("/policies/:pid", middleware.RequireAdmin(), h.UpdateScalingPolicy)
+	scaling.Delete("/policies/:pid", middleware.RequireAdmin(), h.DeleteScalingPolicy)
+	scaling.Post("/policies/:pid/enable", middleware.RequireAdmin(), h.EnableScalingPolicy)
+	scaling.Post("/policies/:pid/disable", middleware.RequireAdmin(), h.DisableScalingPolicy)
+	scaling.Get("/policies/:pid/events", h.ListScalingEvents)
+	scaling.Get("/events", h.ListRecentScalingEvents)
+	scaling.Get("/metrics", h.GetScalingMetrics)
+
 	// Webhooks (unauthenticated, signature-validated)
 	webhooks := app.Group("/webhooks")
 	webhooks.Post("/github", h.GithubWebhook)
 	webhooks.Post("/gitlab", h.GitlabWebhook)
 	webhooks.Post("/bitbucket", h.BitbucketWebhook)
+
+	// Public badge endpoint (no auth — for embedding in READMEs)
+	api.Get("/badges/pipeline/:id", h.GetPipelineBadge)
 
 	// Agent communication endpoints (unauthenticated — token validated by agent server)
 	agentComm := api.Group("/agents")

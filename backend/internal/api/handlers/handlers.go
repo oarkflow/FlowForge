@@ -881,6 +881,15 @@ func (h *Handler) CreatePipeline(c fiber.Ctx) error {
 		triggers = *input.Triggers
 	}
 
+	// Auto-extract triggers from YAML config on: section
+	if input.ConfigContent != nil && *input.ConfigContent != "" {
+		if spec, err := pipeline.Parse(*input.ConfigContent); err == nil {
+			if triggersJSON, err := json.Marshal(spec.On); err == nil {
+				triggers = string(triggersJSON)
+			}
+		}
+	}
+
 	configPath := ".flowforge.yml"
 	if input.ConfigPath != nil && *input.ConfigPath != "" {
 		configPath = *input.ConfigPath
@@ -990,6 +999,13 @@ func (h *Handler) UpdatePipeline(c fiber.Ctx) error {
 		p.ConfigContent = input.ConfigContent
 		p.ConfigVersion++
 
+		// Auto-extract triggers from YAML config on: section
+		if spec, err := pipeline.Parse(*input.ConfigContent); err == nil {
+			if triggersJSON, err := json.Marshal(spec.On); err == nil {
+				p.Triggers = string(triggersJSON)
+			}
+		}
+
 		// Create a new version record
 		userID := getUserID(c)
 		_ = h.repo.Pipelines.CreateVersion(c.Context(), &models.PipelineVersion{
@@ -1042,6 +1058,16 @@ type triggerPipelineInput struct {
 
 func (h *Handler) TriggerPipeline(c fiber.Ctx) error {
 	pipelineID := c.Params("pid")
+
+	// Check pipeline is active
+	p, err := h.repo.Pipelines.GetByID(c.Context(), pipelineID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "pipeline not found")
+	}
+	if p.IsActive == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "pipeline is disabled")
+	}
+
 	var input triggerPipelineInput
 	// Input is optional for manual triggers
 	_ = c.Bind().JSON(&input)
@@ -1193,6 +1219,15 @@ func (h *Handler) RerunPipeline(c fiber.Ctx) error {
 	origRun, err := h.repo.Runs.GetByID(c.Context(), runID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "run not found")
+	}
+
+	// Check pipeline is active
+	p, err := h.repo.Pipelines.GetByID(c.Context(), origRun.PipelineID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "pipeline not found")
+	}
+	if p.IsActive == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "pipeline is disabled")
 	}
 
 	userID := getUserID(c)
@@ -1739,6 +1774,8 @@ type githubWebhookEvent struct {
 	Ref        string `json:"ref"`
 	Before     string `json:"before"`
 	After      string `json:"after"`
+	Action     string `json:"action,omitempty"`      // PR action: opened, synchronize, reopened, closed
+	RefType    string `json:"ref_type,omitempty"`     // create event: "tag" or "branch"
 	Repository struct {
 		ID       int    `json:"id"`
 		FullName string `json:"full_name"`
@@ -1752,6 +1789,11 @@ type githubWebhookEvent struct {
 			Email string `json:"email"`
 		} `json:"author"`
 	} `json:"head_commit"`
+	Commits []struct {
+		Added    []string `json:"added"`
+		Modified []string `json:"modified"`
+		Removed  []string `json:"removed"`
+	} `json:"commits,omitempty"`
 	PullRequest *struct {
 		Number int    `json:"number"`
 		Title  string `json:"title"`
@@ -1764,6 +1806,10 @@ type githubWebhookEvent struct {
 			Ref string `json:"ref"`
 		} `json:"base"`
 	} `json:"pull_request,omitempty"`
+	Release *struct {
+		TagName string `json:"tag_name"`
+		Name    string `json:"name"`
+	} `json:"release,omitempty"`
 }
 
 func (h *Handler) GithubWebhook(c fiber.Ctx) error {
@@ -1827,14 +1873,19 @@ func (h *Handler) GithubWebhook(c fiber.Ctx) error {
 
 	// Determine trigger type and create pipeline runs
 	var triggerType string
-	var branch, commitSHA, commitMsg, author string
+	var branch, commitSHA, commitMsg, author, tag string
+	triggerData := map[string]string{}
 
 	switch eventType {
 	case "push":
 		triggerType = "push"
-		// Extract branch from ref (refs/heads/main → main)
-		branch = strings.TrimPrefix(event.Ref, "refs/heads/")
-		branch = strings.TrimPrefix(branch, "refs/tags/")
+		ref := event.Ref
+		if strings.HasPrefix(ref, "refs/tags/") {
+			tag = strings.TrimPrefix(ref, "refs/tags/")
+			triggerData["tag"] = tag
+		} else {
+			branch = strings.TrimPrefix(ref, "refs/heads/")
+		}
 		commitSHA = event.After
 		if event.HeadCommit.ID != "" {
 			commitSHA = event.HeadCommit.ID
@@ -1848,6 +1899,26 @@ func (h *Handler) GithubWebhook(c fiber.Ctx) error {
 			branch = event.PullRequest.Head.Ref
 			commitSHA = event.PullRequest.Head.SHA
 			commitMsg = event.PullRequest.Title
+			triggerData["action"] = event.Action
+			triggerData["base_branch"] = event.PullRequest.Base.Ref
+		}
+
+	case "create":
+		triggerType = "create"
+		triggerData["ref_type"] = event.RefType
+		if event.RefType == "tag" {
+			tag = event.Ref
+			triggerData["tag"] = tag
+		} else {
+			branch = event.Ref
+		}
+
+	case "release":
+		triggerType = "release"
+		if event.Release != nil {
+			tag = event.Release.TagName
+			triggerData["tag"] = tag
+			triggerData["tag_name"] = event.Release.TagName
 		}
 
 	case "ping":
@@ -1856,6 +1927,30 @@ func (h *Handler) GithubWebhook(c fiber.Ctx) error {
 	default:
 		// Acknowledge but don't process
 		return c.JSON(fiber.Map{"message": "event received", "event": eventType})
+	}
+
+	// Build changeset from commits for monorepo path filtering
+	var changeSet *pipeline.ChangeSet
+	if len(event.Commits) > 0 {
+		filesMap := make(map[string]struct{})
+		for _, commit := range event.Commits {
+			for _, f := range commit.Added {
+				filesMap[f] = struct{}{}
+			}
+			for _, f := range commit.Modified {
+				filesMap[f] = struct{}{}
+			}
+			for _, f := range commit.Removed {
+				filesMap[f] = struct{}{}
+			}
+		}
+		if len(filesMap) > 0 {
+			files := make([]string, 0, len(filesMap))
+			for f := range filesMap {
+				files = append(files, f)
+			}
+			changeSet = &pipeline.ChangeSet{Files: files}
+		}
 	}
 
 	// Find pipelines for this repository and create runs
@@ -1870,11 +1965,23 @@ func (h *Handler) GithubWebhook(c fiber.Ctx) error {
 			continue
 		}
 
-		triggerData := map[string]string{
-			"event":      eventType,
-			"repository": repoFullName,
-			"sender":     author,
+		// Check trigger matching against pipeline config
+		if p.ConfigContent != nil && *p.ConfigContent != "" {
+			spec, err := pipeline.Parse(*p.ConfigContent)
+			if err == nil && !pipeline.MatchTrigger(spec, triggerType, triggerData) {
+				continue // Trigger rules don't match this event
+			}
 		}
+
+		// Monorepo path filter check: skip pipeline if changeset doesn't match
+		if changeSet != nil && (p.PathFilters != "" || p.IgnorePaths != "") {
+			if !pipeline.MatchesPathFilters(changeSet, p.PathFilters, p.IgnorePaths) {
+				continue
+			}
+		}
+
+		triggerData["event"] = eventType
+		triggerData["repository"] = repoFullName
 		if branch != "" {
 			triggerData["branch"] = branch
 		}
@@ -1885,7 +1992,11 @@ func (h *Handler) GithubWebhook(c fiber.Ctx) error {
 			triggerData["commit_message"] = commitMsg
 		}
 		if author != "" {
+			triggerData["sender"] = author
 			triggerData["author"] = author
+		}
+		if tag != "" {
+			triggerData["tag"] = tag
 		}
 
 		run, err := h.engine.TriggerPipeline(c.Context(), p.ID, triggerType, triggerData)
@@ -1929,6 +2040,9 @@ func (h *Handler) GitlabWebhook(c fiber.Ctx) error {
 			Author  struct {
 				Name string `json:"name"`
 			} `json:"author"`
+			Added    []string `json:"added"`
+			Modified []string `json:"modified"`
+			Removed  []string `json:"removed"`
 		} `json:"commits"`
 	}
 
@@ -1966,11 +2080,18 @@ func (h *Handler) GitlabWebhook(c fiber.Ctx) error {
 
 	// Determine trigger type
 	triggerType := "push"
+	triggerData := map[string]string{}
 	if payload.ObjectKind == "merge_request" {
 		triggerType = "pull_request"
+	} else if payload.ObjectKind == "tag_push" || payload.EventName == "tag_push" {
+		triggerType = "push"
+		// Extract tag name from refs/tags/v1.0
+		tagName := strings.TrimPrefix(payload.Ref, "refs/tags/")
+		triggerData["tag"] = tagName
 	}
 
 	branch := strings.TrimPrefix(payload.Ref, "refs/heads/")
+	branch = strings.TrimPrefix(branch, "refs/tags/")
 	var commitSHA, commitMsg, author string
 	if len(payload.Commits) > 0 {
 		lastCommit := payload.Commits[len(payload.Commits)-1]
@@ -1981,6 +2102,30 @@ func (h *Handler) GitlabWebhook(c fiber.Ctx) error {
 		commitSHA = payload.After
 	}
 
+	// Build changeset from GitLab commits for monorepo path filtering
+	var glChangeSet *pipeline.ChangeSet
+	if len(payload.Commits) > 0 {
+		filesMap := make(map[string]struct{})
+		for _, commit := range payload.Commits {
+			for _, f := range commit.Added {
+				filesMap[f] = struct{}{}
+			}
+			for _, f := range commit.Modified {
+				filesMap[f] = struct{}{}
+			}
+			for _, f := range commit.Removed {
+				filesMap[f] = struct{}{}
+			}
+		}
+		if len(filesMap) > 0 {
+			files := make([]string, 0, len(filesMap))
+			for f := range filesMap {
+				files = append(files, f)
+			}
+			glChangeSet = &pipeline.ChangeSet{Files: files}
+		}
+	}
+
 	// Create pipeline runs
 	pipelines, _ := h.repo.Pipelines.ListByProject(c.Context(), matchedRepo.ProjectID, 1000, 0)
 	runsCreated := 0
@@ -1989,10 +2134,23 @@ func (h *Handler) GitlabWebhook(c fiber.Ctx) error {
 			continue
 		}
 
-		triggerData := map[string]string{
-			"event":      payload.ObjectKind,
-			"repository": payload.Project.PathWithNamespace,
+		// Check trigger matching against pipeline config
+		if p.ConfigContent != nil && *p.ConfigContent != "" {
+			spec, err := pipeline.Parse(*p.ConfigContent)
+			if err == nil && !pipeline.MatchTrigger(spec, triggerType, triggerData) {
+				continue // Trigger rules don't match this event
+			}
 		}
+
+		// Monorepo path filter check
+		if glChangeSet != nil && (p.PathFilters != "" || p.IgnorePaths != "") {
+			if !pipeline.MatchesPathFilters(glChangeSet, p.PathFilters, p.IgnorePaths) {
+				continue
+			}
+		}
+
+		triggerData["event"] = payload.ObjectKind
+		triggerData["repository"] = payload.Project.PathWithNamespace
 		if branch != "" {
 			triggerData["branch"] = branch
 		}
@@ -2079,6 +2237,7 @@ func (h *Handler) BitbucketWebhook(c fiber.Ctx) error {
 	}
 
 	var triggerType, branch, commitSHA, commitMsg, author string
+	triggerData := map[string]string{}
 
 	switch {
 	case strings.HasPrefix(eventType, "repo:push"):
@@ -2092,6 +2251,18 @@ func (h *Handler) BitbucketWebhook(c fiber.Ctx) error {
 		}
 	case strings.HasPrefix(eventType, "pullrequest:"):
 		triggerType = "pull_request"
+		// Extract action from event key: "pullrequest:created" → "opened", "pullrequest:updated" → "synchronize"
+		action := strings.TrimPrefix(eventType, "pullrequest:")
+		switch action {
+		case "created":
+			triggerData["action"] = "opened"
+		case "updated":
+			triggerData["action"] = "synchronize"
+		case "fulfilled", "rejected":
+			triggerData["action"] = "closed"
+		default:
+			triggerData["action"] = action
+		}
 		if payload.PullRequest != nil {
 			branch = payload.PullRequest.Source.Branch.Name
 			commitSHA = payload.PullRequest.Source.Commit.Hash
@@ -2108,10 +2279,20 @@ func (h *Handler) BitbucketWebhook(c fiber.Ctx) error {
 			continue
 		}
 
-		triggerData := map[string]string{
-			"event":      eventType,
-			"repository": payload.Repository.FullName,
+		// Check trigger matching against pipeline config
+		if p.ConfigContent != nil && *p.ConfigContent != "" {
+			spec, err := pipeline.Parse(*p.ConfigContent)
+			if err == nil && !pipeline.MatchTrigger(spec, triggerType, triggerData) {
+				continue // Trigger rules don't match this event
+			}
 		}
+
+		// Note: Bitbucket webhook payloads do not include changed file lists,
+		// so monorepo path filtering cannot be applied here. Pipelines with
+		// path_filters set will still trigger on Bitbucket pushes.
+
+		triggerData["event"] = eventType
+		triggerData["repository"] = payload.Repository.FullName
 		if branch != "" {
 			triggerData["branch"] = branch
 		}

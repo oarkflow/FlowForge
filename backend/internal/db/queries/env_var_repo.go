@@ -83,13 +83,14 @@ func (r *EnvVarRepo) BulkSave(ctx context.Context, projectID string, vars []mode
 
 	// Insert new vars
 	now := time.Now()
+	insertQuery := "INSERT INTO project_env_vars (id, project_id, key, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 	for _, ev := range vars {
 		id := ev.ID
 		if id == "" {
 			id = uuid.New().String()
 		}
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO project_env_vars (id, project_id, key, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+			insertQuery,
 			id, projectID, ev.Key, ev.Value, now, now,
 		); err != nil {
 			return err

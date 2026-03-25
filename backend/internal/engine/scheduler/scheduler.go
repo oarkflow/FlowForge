@@ -22,8 +22,9 @@ type PipelineConfig struct {
 
 // StageConfig describes a single stage containing one or more jobs.
 type StageConfig struct {
-	Name string      `json:"name"`
-	Jobs []JobConfig `json:"jobs"`
+	Name  string      `json:"name"`
+	Needs []string    `json:"needs,omitempty"` // stage dependencies for DAG-based execution
+	Jobs  []JobConfig `json:"jobs"`
 }
 
 // JobConfig describes a single job containing one or more steps.
@@ -46,12 +47,17 @@ type StepConfig struct {
 // It receives the context, the pipeline run ID, and the parsed pipeline config.
 type RunFunc func(ctx context.Context, pipelineRunID string, config PipelineConfig) error
 
+// OnCompleteFunc is called after a pipeline run finishes (success or failure).
+// It receives the context, the run ID, and the final status.
+type OnCompleteFunc func(ctx context.Context, runID string, status string)
+
 // Scheduler polls the priority queue and dispatches jobs for execution.
 type Scheduler struct {
-	queue *queue.PriorityQueue
-	repos *queries.Repositories
-	hub   *websocket.Hub
-	runFn RunFunc
+	queue        *queue.PriorityQueue
+	repos        *queries.Repositories
+	hub          *websocket.Hub
+	runFn        RunFunc
+	onCompleteFn OnCompleteFunc
 }
 
 // New creates a new Scheduler.
@@ -67,6 +73,12 @@ func New(q *queue.PriorityQueue, db *sqlx.DB, hub *websocket.Hub) *Scheduler {
 // This must be called before Start.
 func (s *Scheduler) SetRunFunc(fn RunFunc) {
 	s.runFn = fn
+}
+
+// SetOnCompleteFunc sets a callback invoked after each pipeline run finishes.
+// This is used by the engine for pipeline composition (downstream triggers).
+func (s *Scheduler) SetOnCompleteFunc(fn OnCompleteFunc) {
+	s.onCompleteFn = fn
 }
 
 // Start begins the scheduling loop. It blocks until ctx is cancelled.
@@ -173,6 +185,11 @@ func (s *Scheduler) finishRun(ctx context.Context, runID, status string, duratio
 		log.Error().Err(err).Str("run_id", runID).Msg("scheduler: failed to update run status")
 	}
 	s.broadcastStatus(runID, status)
+
+	// Notify the engine for pipeline composition (downstream triggers)
+	if s.onCompleteFn != nil {
+		s.onCompleteFn(ctx, runID, status)
+	}
 }
 
 // broadcastStatus sends a JSON status message to WebSocket clients subscribed to the run.

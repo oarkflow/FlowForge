@@ -1,0 +1,14 @@
+-- Pipeline composition: cross-project triggers and fan-out/fan-in
+CREATE TABLE IF NOT EXISTS pipeline_links (
+    id              TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    source_pipeline_id  TEXT NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+    target_pipeline_id  TEXT NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+    link_type       TEXT NOT NULL DEFAULT 'trigger' CHECK(link_type IN ('trigger','fan_out','fan_in')),
+    condition       TEXT NOT NULL DEFAULT '',
+    pass_variables  BOOLEAN NOT NULL DEFAULT 0,
+    enabled         BOOLEAN NOT NULL DEFAULT 1,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_pipeline_id, target_pipeline_id, link_type)
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_links_source ON pipeline_links(source_pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_links_target ON pipeline_links(target_pipeline_id);

@@ -9,19 +9,22 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func Connect(path string) *sqlx.DB {
-	dir := filepath.Dir(path)
+func Connect(dsn string) (*sqlx.DB, error) {
+	dir := filepath.Dir(dsn)
 	if dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0755)
 	}
 
-	dsn := fmt.Sprintf(
+	sqliteDSN := fmt.Sprintf(
 		"file:%s?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=on&_busy_timeout=5000&cache=shared",
-		path,
+		dsn,
 	)
-	database := sqlx.MustConnect("sqlite3", dsn)
-	database.SetMaxOpenConns(1)
-	database.SetMaxIdleConns(1)
-	database.SetConnMaxLifetime(0)
-	return database
+	db, err := sqlx.Open("sqlite3", sqliteDSN)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	return db, nil
 }

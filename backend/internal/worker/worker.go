@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/oarkflow/deploy/backend/internal/scheduler"
 	"github.com/rs/zerolog/log"
 )
 
@@ -24,12 +25,19 @@ type PipelineEngine interface {
 	ReenqueueRun(ctx context.Context, runID string) error
 }
 
+// AutoScalerService is the interface for the auto-scaler evaluator.
+type AutoScalerService interface {
+	Evaluate(ctx context.Context) error
+}
+
 // Pool manages background worker goroutines for periodic tasks.
 type Pool struct {
-	mu     sync.Mutex
-	tasks  []Task
-	db     *sqlx.DB
-	engine PipelineEngine
+	mu         sync.Mutex
+	tasks      []Task
+	db         *sqlx.DB
+	engine     PipelineEngine
+	scheduler  *scheduler.Service
+	autoScaler AutoScalerService
 }
 
 // NewPool creates a new worker pool.
@@ -42,6 +50,20 @@ func (p *Pool) SetEngine(engine PipelineEngine) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.engine = engine
+}
+
+// SetScheduler sets the scheduler service for cron-based pipeline triggers.
+func (p *Pool) SetScheduler(svc *scheduler.Service) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.scheduler = svc
+}
+
+// SetAutoScaler sets the auto-scaler service for automatic agent scaling.
+func (p *Pool) SetAutoScaler(as AutoScalerService) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.autoScaler = as
 }
 
 // Register adds a new periodic task to the pool.
@@ -62,6 +84,9 @@ func (p *Pool) RegisterDefaults() {
 	p.Register("log_cleanup", 6*time.Hour, p.logCleanupTask)
 	p.Register("metrics_collector", 1*time.Minute, p.metricsCollectorTask)
 	p.Register("stale_run_recovery", 30*time.Second, p.staleRunRecoveryTask)
+	p.Register("approval_expiry", 1*time.Minute, p.approvalExpiryTask)
+	p.Register("schedule_checker", 30*time.Second, p.scheduleCheckerTask)
+	p.Register("autoscaler", 30*time.Second, p.autoscalerTask)
 }
 
 // Start launches all registered tasks as goroutines. Blocks until ctx is cancelled.
@@ -141,10 +166,12 @@ func (p *Pool) agentHealthTask(ctx context.Context) error {
 	}
 
 	// Mark agents as offline if no heartbeat for 60 seconds
+	cutoff := time.Now().Add(-60 * time.Second)
 	result, err := p.db.ExecContext(ctx,
 		`UPDATE agents SET status = 'offline'
 		 WHERE status IN ('online', 'busy')
-		 AND datetime(last_seen_at) < datetime('now', '-60 seconds')`)
+		 AND last_seen_at < ?`,
+		cutoff)
 	if err != nil {
 		return err
 	}
@@ -164,8 +191,10 @@ func (p *Pool) logCleanupTask(ctx context.Context) error {
 	}
 
 	// Default retention: 30 days
+	cutoff := time.Now().AddDate(0, 0, -30)
 	result, err := p.db.ExecContext(ctx,
-		"DELETE FROM run_logs WHERE ts < datetime('now', '-30 days')")
+		"DELETE FROM run_logs WHERE ts < ?",
+		cutoff)
 	if err != nil {
 		return err
 	}
@@ -206,10 +235,12 @@ func (p *Pool) staleRunRecoveryTask(ctx context.Context) error {
 	}
 
 	// Mark runs stuck in "running" as failed (these were interrupted by a crash/restart)
+	staleCutoff := time.Now().Add(-5 * time.Minute)
 	result, err := p.db.ExecContext(ctx,
 		`UPDATE pipeline_runs SET status = 'failure', finished_at = CURRENT_TIMESTAMP
 		 WHERE status = 'running'
-		 AND datetime(started_at) < datetime('now', '-5 minutes')`)
+		 AND started_at < ?`,
+		staleCutoff)
 	if err != nil {
 		return err
 	}
@@ -231,12 +262,14 @@ func (p *Pool) staleRunRecoveryTask(ctx context.Context) error {
 		ID string `db:"id"`
 	}
 	var staleQueued []queuedRun
+	queuedCutoff := time.Now().Add(-10 * time.Second)
 	err = p.db.SelectContext(ctx, &staleQueued,
 		`SELECT id FROM pipeline_runs
 		 WHERE status = 'queued'
-		 AND datetime(created_at) < datetime('now', '-10 seconds')
+		 AND created_at < ?
 		 ORDER BY created_at ASC
-		 LIMIT 50`)
+		 LIMIT 50`,
+		queuedCutoff)
 	if err != nil {
 		return err
 	}
@@ -250,4 +283,54 @@ func (p *Pool) staleRunRecoveryTask(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// approvalExpiryTask expires pending approvals that have passed their deadline.
+func (p *Pool) approvalExpiryTask(ctx context.Context) error {
+	if p.db == nil {
+		return nil
+	}
+
+	result, err := p.db.ExecContext(ctx,
+		`UPDATE approvals SET status = 'expired', resolved_at = CURRENT_TIMESTAMP
+		 WHERE status = 'pending'
+		 AND expires_at IS NOT NULL
+		 AND expires_at < ?`,
+		time.Now())
+	if err != nil {
+		return err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows > 0 {
+		log.Info().Int64("expired", rows).Msg("pending approvals expired")
+	}
+
+	return nil
+}
+
+// scheduleCheckerTask checks for due pipeline schedules and triggers runs.
+func (p *Pool) scheduleCheckerTask(ctx context.Context) error {
+	p.mu.Lock()
+	svc := p.scheduler
+	p.mu.Unlock()
+
+	if svc == nil {
+		return nil
+	}
+
+	return svc.ProcessDueSchedules(ctx)
+}
+
+// autoscalerTask evaluates scaling policies and records scaling decisions.
+func (p *Pool) autoscalerTask(ctx context.Context) error {
+	p.mu.Lock()
+	as := p.autoScaler
+	p.mu.Unlock()
+
+	if as == nil {
+		return nil
+	}
+
+	return as.Evaluate(ctx)
 }

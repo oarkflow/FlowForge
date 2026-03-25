@@ -14,6 +14,8 @@ type Pipeline struct {
 	ConfigVersion int        `db:"config_version" json:"config_version"`
 	Triggers      string     `db:"triggers" json:"triggers"`
 	IsActive      int        `db:"is_active" json:"is_active"`
+	PathFilters   string     `db:"path_filters" json:"path_filters"`     // monorepo: comma-separated glob patterns
+	IgnorePaths   string     `db:"ignore_paths" json:"ignore_paths"`     // monorepo: comma-separated glob patterns to exclude
 	CreatedBy     *string    `db:"created_by" json:"created_by,omitempty"`
 	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`

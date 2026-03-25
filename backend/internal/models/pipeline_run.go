@@ -25,9 +25,10 @@ type PipelineRun struct {
 // PipelineRunWithMeta extends PipelineRun with pipeline and project context for global views.
 type PipelineRunWithMeta struct {
 	PipelineRun
-	PipelineName string `db:"pipeline_name" json:"pipeline_name"`
-	ProjectID    string `db:"project_id" json:"project_id"`
-	ProjectName  string `db:"project_name" json:"project_name"`
+	PipelineName     string `db:"pipeline_name" json:"pipeline_name"`
+	ProjectID        string `db:"project_id" json:"project_id"`
+	ProjectName      string `db:"project_name" json:"project_name"`
+	PipelineIsActive int    `db:"pipeline_is_active" json:"pipeline_is_active"`
 }
 
 type StageRun struct {

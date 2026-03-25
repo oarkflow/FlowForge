@@ -267,6 +267,108 @@ func (p *Pool) OnlineCount() int {
 	return count
 }
 
+// CountByLabels counts agents matching the given executor type and labels that are online or busy.
+func (p *Pool) CountByLabels(executorType, labels string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// Parse comma-separated labels
+	var required []string
+	if labels != "" {
+		for _, l := range splitLabels(labels) {
+			l = trimSpace(l)
+			if l != "" {
+				required = append(required, l)
+			}
+		}
+	}
+
+	count := 0
+	for _, a := range p.agents {
+		if a.Status != "online" && a.Status != "busy" {
+			continue
+		}
+		if executorType != "" && a.Executor != executorType {
+			continue
+		}
+		if !hasAllLabels(a.Labels, required) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+// BusyCount returns the number of busy agents.
+func (p *Pool) BusyCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, a := range p.agents {
+		if a.Status == "busy" {
+			count++
+		}
+	}
+	return count
+}
+
+// CountByExecutor returns a map of executor type to agent count (online or busy agents).
+func (p *Pool) CountByExecutor() map[string]int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	result := make(map[string]int)
+	for _, a := range p.agents {
+		if a.Status == "online" || a.Status == "busy" {
+			result[a.Executor]++
+		}
+	}
+	return result
+}
+
+// CountByLabel returns a map of label to agent count (online or busy agents).
+func (p *Pool) CountByLabel() map[string]int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	result := make(map[string]int)
+	for _, a := range p.agents {
+		if a.Status == "online" || a.Status == "busy" {
+			for _, l := range a.Labels {
+				result[l]++
+			}
+		}
+	}
+	return result
+}
+
+// splitLabels splits a comma-separated labels string into a slice.
+func splitLabels(s string) []string {
+	var result []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			result = append(result, s[start:i])
+			start = i + 1
+		}
+	}
+	result = append(result, s[start:])
+	return result
+}
+
+// trimSpace trims leading and trailing whitespace from a string.
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
+
 // hasAllLabels checks if agentLabels contains all required labels.
 func hasAllLabels(agentLabels, required []string) bool {
 	if len(required) == 0 {
