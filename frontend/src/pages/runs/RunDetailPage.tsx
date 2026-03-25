@@ -67,20 +67,35 @@ function ansiToHtml(text: string): string {
 		.replace(/\x1b\[\d+m/g, '');
 }
 
-// Get CSS class for a log line based on its stream type
-function streamClass(stream: string): string {
+// Get CSS class for a log line based on its stream type and content
+function streamClass(stream: string, content?: string): string {
 	switch (stream) {
 		case 'stderr': return 'text-red-400';
-		case 'system': return 'text-amber-400/80';
+		case 'system': {
+			if (content) {
+				const lower = content.toLowerCase();
+				if (lower.includes('— success') || lower.includes('- success') || lower.includes('— passed') || lower.includes('checked out')) return 'text-emerald-400';
+				if (lower.includes('— fail') || lower.includes('- fail') || lower.includes('— error')) return 'text-red-400';
+				if (lower.includes('warning:')) return 'text-amber-400';
+			}
+			return 'text-blue-400/80';
+		}
 		default: return 'text-[#c9d1d9]'; // stdout — default terminal foreground
 	}
 }
 
 // Stream indicator icon (small colored dot/marker)
-function streamIndicator(stream: string) {
+function streamIndicator(stream: string, content?: string) {
 	switch (stream) {
 		case 'stderr': return <span class="w-1.5 h-1.5 rounded-full bg-red-400 flex-shrink-0 mt-2" />;
-		case 'system': return <span class="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0 mt-2" />;
+		case 'system': {
+			if (content) {
+				const lower = content.toLowerCase();
+				if (lower.includes('— success') || lower.includes('- success') || lower.includes('— passed') || lower.includes('checked out')) return <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0 mt-2" />;
+				if (lower.includes('— fail') || lower.includes('- fail') || lower.includes('— error')) return <span class="w-1.5 h-1.5 rounded-full bg-red-400 flex-shrink-0 mt-2" />;
+			}
+			return <span class="w-1.5 h-1.5 rounded-full bg-blue-400 flex-shrink-0 mt-2" />;
+		}
 		default: return <span class="w-1.5 h-1.5 rounded-full bg-emerald-400/50 flex-shrink-0 mt-2" />;
 	}
 }
@@ -483,7 +498,7 @@ const RunDetailPage: Component = () => {
 							<div class="flex items-center gap-3 px-2 mb-3 text-[10px] text-[var(--color-text-tertiary)]">
 								<span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400/50" /> stdout</span>
 								<span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-red-400" /> stderr</span>
-								<span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-amber-400" /> system</span>
+								<span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-blue-400" /> system</span>
 							</div>
 
 							<Show when={stages().length > 0} fallback={
@@ -622,8 +637,8 @@ const RunDetailPage: Component = () => {
 											<span class="w-10 flex-shrink-0 text-right pr-3 text-[var(--color-text-tertiary)] select-none opacity-40 group-hover:opacity-100">
 												{i() + 1}
 											</span>
-											{streamIndicator(entry.stream)}
-											<span class={`flex-1 whitespace-pre-wrap break-all ml-2 ${streamClass(entry.stream)}`} innerHTML={ansiToHtml(entry.content)} />
+											{streamIndicator(entry.stream, entry.content)}
+											<span class={`flex-1 whitespace-pre-wrap break-all ml-2 ${streamClass(entry.stream, entry.content)}`} innerHTML={ansiToHtml(entry.content)} />
 										</div>
 									)}
 								</For>
