@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,19 @@ func (r *Runner) RunPipeline(ctx context.Context, runID string, config scheduler
 	// Broadcast so the frontend can immediately see the full tree
 	r.broadcastStatusChange(runID, "pipeline", runID, "", "running")
 
+	// Create a single workspace volume for the entire run, shared across all
+	// stages and jobs. This ensures that files from the install stage (e.g.
+	// node_modules, vendor/) persist into test and build stages.
+	volumeName := fmt.Sprintf("flowforge-ws-%s", runID)
+	tempExec, _ := executor.NewExecutor("docker")
+	if dockerExec, ok := tempExec.(*executor.DockerExecutor); ok {
+		if err := dockerExec.CreateVolume(ctx, volumeName); err != nil {
+			return fmt.Errorf("create workspace volume: %w", err)
+		}
+		defer dockerExec.RemoveVolume(context.Background(), volumeName)
+		r.broadcastLog(runID, "", "system", fmt.Sprintf("Created workspace volume: %s\n", volumeName))
+	}
+
 	// Execute stages sequentially
 	for i, stageCfg := range config.Stages {
 		if err := ctx.Err(); err != nil {
@@ -65,7 +79,7 @@ func (r *Runner) RunPipeline(ctx context.Context, runID string, config scheduler
 			return fmt.Errorf("pipeline cancelled: %w", err)
 		}
 
-		if err := r.runStage(ctx, runID, ids.stageIDs[i], stageCfg, ids.jobIDs[i], ids.stepIDs[i]); err != nil {
+		if err := r.runStage(ctx, runID, ids.stageIDs[i], stageCfg, ids.jobIDs[i], ids.stepIDs[i], volumeName); err != nil {
 			// Mark remaining stages as skipped
 			for j := i + 1; j < len(config.Stages); j++ {
 				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[j], "skipped")
@@ -104,7 +118,7 @@ func (r *Runner) preCreateRecords(ctx context.Context, runID string, config sche
 		for j, jobCfg := range stageCfg.Jobs {
 			executorType := jobCfg.ExecutorType
 			if executorType == "" {
-				executorType = "local"
+				executorType = "docker"
 			}
 			jobRun := &models.JobRun{
 				StageRunID:   stageRun.ID,
@@ -137,7 +151,7 @@ func (r *Runner) preCreateRecords(ctx context.Context, runID string, config sche
 }
 
 // runStage executes all jobs in a stage in parallel and updates status.
-func (r *Runner) runStage(ctx context.Context, runID, stageRunID string, stageCfg scheduler.StageConfig, jobIDs []string, stepIDs [][]string) error {
+func (r *Runner) runStage(ctx context.Context, runID, stageRunID string, stageCfg scheduler.StageConfig, jobIDs []string, stepIDs [][]string, volumeName string) error {
 	// Mark stage as running
 	now := time.Now()
 	r.repos.Runs.SetStageRunStarted(ctx, stageRunID)
@@ -157,7 +171,7 @@ func (r *Runner) runStage(ctx context.Context, runID, stageRunID string, stageCf
 		wg.Add(1)
 		go func(jc scheduler.JobConfig, jobRunID string, stpIDs []string) {
 			defer wg.Done()
-			if err := r.runJob(ctx, runID, jobRunID, jc, stpIDs); err != nil {
+			if err := r.runJob(ctx, runID, jobRunID, jc, stpIDs, volumeName); err != nil {
 				mu.Lock()
 				jobErrs = append(jobErrs, err)
 				mu.Unlock()
@@ -187,10 +201,10 @@ func (r *Runner) runStage(ctx context.Context, runID, stageRunID string, stageCf
 }
 
 // runJob executes all steps in a job sequentially and updates status.
-func (r *Runner) runJob(ctx context.Context, runID, jobRunID string, jobCfg scheduler.JobConfig, stepIDs []string) error {
+func (r *Runner) runJob(ctx context.Context, runID, jobRunID string, jobCfg scheduler.JobConfig, stepIDs []string, volumeName string) error {
 	executorType := jobCfg.ExecutorType
 	if executorType == "" {
-		executorType = "local"
+		executorType = "docker"
 	}
 
 	// Mark job as running
@@ -206,6 +220,12 @@ func (r *Runner) runJob(ctx context.Context, runID, jobRunID string, jobCfg sche
 	if err != nil {
 		r.failJob(ctx, runID, jobRunID, stepIDs, err.Error())
 		return err
+	}
+
+	// For Docker executor: use the shared workspace volume created at the run
+	// level, so all stages and jobs share the same /workspace directory.
+	if dockerExec, ok := exec.(*executor.DockerExecutor); ok {
+		dockerExec.WorkspaceVolume = volumeName
 	}
 
 	// Execute steps sequentially
@@ -270,6 +290,7 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 	}
 
 	// Create log writer for real-time streaming
+	var lastStderrLine string
 	logWriter := func(stream string, content []byte) {
 		logEntry := &models.RunLog{
 			RunID:     runID,
@@ -280,6 +301,11 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 		if err := r.repos.Logs.Insert(ctx, logEntry); err != nil {
 			log.Error().Err(err).Msg("runner: failed to persist log line")
 		}
+		if stream == "stderr" {
+			if line := lastNonEmptyLine(string(content)); line != "" {
+				lastStderrLine = line
+			}
+		}
 		r.broadcastLogEntry(runID, stepRunID, stream, content)
 	}
 
@@ -288,8 +314,11 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 	var execErr error
 
 	if streamExec, ok := exec.(executor.StreamingExecutor); ok {
+		// Streaming executor: logWriter is called in real-time during execution.
+		// Do NOT re-broadcast the buffered stdout/stderr afterwards.
 		result, execErr = streamExec.ExecuteWithLogs(ctx, step, logWriter)
 	} else {
+		// Non-streaming executor: logs come back as buffered result only.
 		result, execErr = exec.Execute(ctx, step)
 		if result != nil {
 			if result.Stdout != "" {
@@ -317,7 +346,16 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 		if execErr != nil {
 			errMsg = execErr.Error()
 		} else if result != nil && result.ExitCode != 0 {
-			errMsg = fmt.Sprintf("process exited with code %d", result.ExitCode)
+			// Try to extract the actual error message from stderr output
+			stderrLine := lastNonEmptyLine(result.Stderr)
+			if stderrLine == "" {
+				stderrLine = lastStderrLine // fallback to streamed stderr
+			}
+			if stderrLine != "" {
+				errMsg = fmt.Sprintf("%s (exit code %d)", stderrLine, result.ExitCode)
+			} else {
+				errMsg = fmt.Sprintf("process exited with code %d", result.ExitCode)
+			}
 		}
 		stepRun.ErrorMessage = &errMsg
 
@@ -398,4 +436,17 @@ func (r *Runner) broadcastStatusChange(runID, entity, entityID, name, status str
 		"status":    status,
 	})
 	r.hub.BroadcastToRun(runID, msg)
+}
+
+// lastNonEmptyLine returns the last non-empty line from the given text.
+// Useful for extracting the actual error message from stderr output.
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }

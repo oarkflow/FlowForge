@@ -79,7 +79,12 @@ function makeRunColumns(projectId: string): TableColumn<PipelineRun>[] {
       <A href={`/projects/${projectId}/pipelines/${row.pipeline_id}/runs/${row.id}`} class="text-sm font-mono font-medium text-indigo-400 hover:text-indigo-300">#{row.number}</A>
     )},
     { key: 'status', header: 'Status', width: '140px', render: (row) => (
-      <Badge variant={getStatusBadgeVariant(row.status)} dot size="sm">{statusLabel[row.status]}</Badge>
+      <div>
+        <Badge variant={getStatusBadgeVariant(row.status)} dot size="sm">{statusLabel[row.status]}</Badge>
+        {row.status === 'failure' && row.error_summary ? (
+          <p class="text-xs text-red-400/80 mt-1 truncate max-w-[200px]" title={row.error_summary}>{row.error_summary}</p>
+        ) : null}
+      </div>
     )},
     { key: 'commit', header: 'Commit', render: (row) => (
       <div class="min-w-0">

@@ -48,7 +48,14 @@ async function fetchProject(id: string) {
 // Run table columns
 const runColumns: TableColumn<PipelineRun>[] = [
   { key: 'number', header: '#', width: '70px', render: (row) => <span class="text-sm font-mono font-medium text-[var(--color-text-primary)]">#{row.number}</span> },
-  { key: 'status', header: 'Status', width: '140px', render: (row) => <Badge variant={getStatusBadgeVariant(row.status)} dot size="sm">{statusLabel[row.status]}</Badge> },
+  { key: 'status', header: 'Status', width: '140px', render: (row) => (
+    <div>
+      <Badge variant={getStatusBadgeVariant(row.status)} dot size="sm">{statusLabel[row.status]}</Badge>
+      {row.status === 'failure' && row.error_summary ? (
+        <p class="text-xs text-red-400/80 mt-1 truncate max-w-[200px]" title={row.error_summary}>{row.error_summary}</p>
+      ) : null}
+    </div>
+  )},
   { key: 'commit', header: 'Commit', render: (row) => (
     <div class="min-w-0">
       <p class="text-sm text-[var(--color-text-primary)] truncate max-w-sm">{row.commit_message || '-'}</p>
@@ -86,6 +93,116 @@ const ProjectDetailPage: Component = () => {
   const [editDesc, setEditDesc] = createSignal('');
   const [editVis, setEditVis] = createSignal('');
   const [savingSettings, setSavingSettings] = createSignal(false);
+
+  // Edit repository modal
+  const [editingRepo, setEditingRepo] = createSignal<Repository | null>(null);
+  const [repoFullName, setRepoFullName] = createSignal('');
+  const [repoCloneUrl, setRepoCloneUrl] = createSignal('');
+  const [repoSshUrl, setRepoSshUrl] = createSignal('');
+  const [repoBranch, setRepoBranch] = createSignal('');
+  const [repoProvider, setRepoProvider] = createSignal('');
+  const [savingRepo, setSavingRepo] = createSignal(false);
+
+  // Create pipeline modal
+  const [showCreatePipeline, setShowCreatePipeline] = createSignal(false);
+  const [newPipelineName, setNewPipelineName] = createSignal('');
+  const [newPipelineDesc, setNewPipelineDesc] = createSignal('');
+  const [newPipelineSource, setNewPipelineSource] = createSignal('db');
+  const [newPipelineConfigPath, setNewPipelineConfigPath] = createSignal('.flowforge.yml');
+  const [creatingPipeline, setCreatingPipeline] = createSignal(false);
+
+  // Trigger pipeline modal
+  const [showTriggerPipeline, setShowTriggerPipeline] = createSignal(false);
+  const [triggerPipelineId, setTriggerPipelineId] = createSignal('');
+  const [triggerBranch, setTriggerBranch] = createSignal('main');
+  const [triggeringPipeline, setTriggeringPipeline] = createSignal(false);
+
+  const openEditRepo = (repo: Repository) => {
+    setEditingRepo(repo);
+    setRepoFullName(repo.full_name);
+    setRepoCloneUrl(repo.clone_url);
+    setRepoSshUrl(repo.ssh_url || '');
+    setRepoBranch(repo.default_branch);
+    setRepoProvider(repo.provider);
+  };
+
+  const handleSaveRepo = async () => {
+    const repo = editingRepo();
+    if (!repo) return;
+    setSavingRepo(true);
+    try {
+      await api.repositories.update(params.id, repo.id, {
+        full_name: repoFullName().trim(),
+        clone_url: repoCloneUrl().trim(),
+        ssh_url: repoSshUrl().trim() || undefined,
+        default_branch: repoBranch().trim(),
+        provider: repoProvider() as Repository['provider'],
+      });
+      toast.success('Repository updated');
+      setEditingRepo(null);
+      refetch();
+    } catch (err) {
+      toast.error(err instanceof ApiRequestError ? err.message : 'Failed to update repository');
+    } finally {
+      setSavingRepo(false);
+    }
+  };
+
+  const handleCreatePipeline = async () => {
+    if (!newPipelineName().trim()) return;
+    setCreatingPipeline(true);
+    try {
+      await api.pipelines.create(params.id, {
+        name: newPipelineName().trim(),
+        description: newPipelineDesc().trim() || undefined,
+        config_source: newPipelineSource() as 'db' | 'repo',
+        config_path: newPipelineSource() === 'repo' ? newPipelineConfigPath().trim() : undefined,
+      });
+      toast.success('Pipeline created');
+      setShowCreatePipeline(false);
+      setNewPipelineName('');
+      setNewPipelineDesc('');
+      setNewPipelineSource('db');
+      refetch();
+    } catch (err) {
+      toast.error(err instanceof ApiRequestError ? err.message : 'Failed to create pipeline');
+    } finally {
+      setCreatingPipeline(false);
+    }
+  };
+
+  const handleTriggerPipeline = async () => {
+    const pid = triggerPipelineId();
+    if (!pid) return;
+    setTriggeringPipeline(true);
+    try {
+      const newRun = await api.pipelines.trigger(params.id, pid, { branch: triggerBranch().trim() || 'main' });
+      toast.success('Pipeline triggered');
+      setShowTriggerPipeline(false);
+      navigate(`/projects/${params.id}/pipelines/${pid}/runs/${newRun.id}`);
+    } catch (err) {
+      toast.error(err instanceof ApiRequestError ? err.message : 'Failed to trigger pipeline');
+    } finally {
+      setTriggeringPipeline(false);
+    }
+  };
+
+  const openTriggerModal = (pipelineId?: string) => {
+    const pips = data()?.pipelines ?? [];
+    setTriggerPipelineId(pipelineId || pips[0]?.id || '');
+    setTriggerBranch('main');
+    setShowTriggerPipeline(true);
+  };
+
+  const handleDeletePipeline = async (pipelineId: string, name: string) => {
+    try {
+      await api.pipelines.delete(params.id, pipelineId);
+      toast.success(`Pipeline "${name}" deleted`);
+      refetch();
+    } catch (err) {
+      toast.error(err instanceof ApiRequestError ? err.message : 'Failed to delete pipeline');
+    }
+  };
 
   // Initialize settings form when data loads
   const initSettings = () => {
@@ -198,7 +315,13 @@ const ProjectDetailPage: Component = () => {
       breadcrumbs={[{ label: 'Projects', href: '/projects' }, { label: project()?.name ?? '...' }]}
       actions={
         <div class="flex items-center gap-2">
-          <A href={`/projects/${params.id}/pipelines`}><Button size="sm">View Pipelines</Button></A>
+          <Button size="sm" variant="outline" onClick={() => openTriggerModal()}
+            icon={<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" /></svg>}
+          >Trigger</Button>
+          <Button size="sm" onClick={() => setShowCreatePipeline(true)}
+            icon={<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>}
+          >New Pipeline</Button>
+          <A href={`/projects/${params.id}/pipelines`}><Button size="sm" variant="ghost">All Pipelines</Button></A>
         </div>
       }
     >
@@ -279,26 +402,45 @@ const ProjectDetailPage: Component = () => {
 
           {/* Pipelines */}
           <Match when={activeTab() === 'pipelines'}>
+            <div class="flex items-center justify-between mb-4">
+              <p class="text-sm text-[var(--color-text-tertiary)]">{(data()?.pipelines ?? []).length} pipeline{(data()?.pipelines ?? []).length !== 1 ? 's' : ''}</p>
+              <div class="flex items-center gap-2">
+                <Button size="sm" variant="outline" onClick={() => openTriggerModal()}
+                  icon={<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" /></svg>}
+                >Trigger Run</Button>
+                <Button size="sm" onClick={() => setShowCreatePipeline(true)}
+                  icon={<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>}
+                >New Pipeline</Button>
+              </div>
+            </div>
             <div class="space-y-4">
-              <For each={data()?.pipelines ?? []} fallback={<p class="text-sm text-[var(--color-text-tertiary)] text-center py-8">No pipelines. <A href={`/projects/${params.id}/pipelines`} class="text-indigo-400">Create one</A></p>}>
+              <For each={data()?.pipelines ?? []} fallback={
+                <div class="text-center py-12">
+                  <svg class="w-12 h-12 mx-auto text-[var(--color-text-tertiary)] mb-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25H12" /></svg>
+                  <p class="text-[var(--color-text-secondary)] mb-2">No pipelines yet</p>
+                  <p class="text-sm text-[var(--color-text-tertiary)] mb-4">Create your first pipeline to automate your builds.</p>
+                  <Button onClick={() => setShowCreatePipeline(true)}>Create Pipeline</Button>
+                </div>
+              }>
                 {(pipeline) => (
-                  <A href={`/projects/${params.id}/pipelines/${pipeline.id}`} class="block">
-                    <Card>
-                      <div class="flex items-center justify-between">
-                        <div class="flex items-center gap-4">
-                          <div class={`w-3 h-3 rounded-full ${pipeline.is_active ? 'bg-emerald-400' : 'bg-gray-500'}`} />
-                          <div>
-                            <h3 class="text-sm font-semibold text-[var(--color-text-primary)]">{pipeline.name}</h3>
-                            <p class="text-xs text-[var(--color-text-tertiary)] mt-0.5">{pipeline.description}</p>
-                          </div>
+                  <Card>
+                    <div class="flex items-center justify-between">
+                      <A href={`/projects/${params.id}/pipelines/${pipeline.id}`} class="flex items-center gap-4 flex-1 min-w-0">
+                        <div class={`w-3 h-3 rounded-full shrink-0 ${pipeline.is_active ? 'bg-emerald-400' : 'bg-gray-500'}`} />
+                        <div class="min-w-0">
+                          <h3 class="text-sm font-semibold text-[var(--color-text-primary)]">{pipeline.name}</h3>
+                          <p class="text-xs text-[var(--color-text-tertiary)] mt-0.5">{pipeline.description || 'No description'}</p>
                         </div>
-                        <div class="flex items-center gap-4">
-                          <p class="text-xs text-[var(--color-text-tertiary)]">v{pipeline.config_version} · {formatRelativeTime(pipeline.updated_at)}</p>
-                          <Badge variant={pipeline.is_active ? 'success' : 'default'} size="sm">{pipeline.is_active ? 'Active' : 'Disabled'}</Badge>
-                        </div>
+                      </A>
+                      <div class="flex items-center gap-3 shrink-0 ml-4">
+                        <p class="text-xs text-[var(--color-text-tertiary)]">v{pipeline.config_version} · {formatRelativeTime(pipeline.updated_at)}</p>
+                        <Badge variant={pipeline.is_active ? 'success' : 'default'} size="sm">{pipeline.is_active ? 'Active' : 'Disabled'}</Badge>
+                        <Button size="sm" variant="outline" onClick={(e: Event) => { e.preventDefault(); e.stopPropagation(); openTriggerModal(pipeline.id); }}>Trigger</Button>
+                        <A href={`/projects/${params.id}/pipelines/${pipeline.id}`}><Button size="sm" variant="ghost">Edit</Button></A>
+                        <Button size="sm" variant="danger" onClick={(e: Event) => { e.preventDefault(); e.stopPropagation(); handleDeletePipeline(pipeline.id, pipeline.name); }}>Delete</Button>
                       </div>
-                    </Card>
-                  </A>
+                    </div>
+                  </Card>
                 )}
               </For>
             </div>
@@ -318,15 +460,17 @@ const ProjectDetailPage: Component = () => {
                 <For each={data()?.repos ?? []}>
                   {(repo) => (
                     <div class="flex items-center justify-between p-4 border-b border-[var(--color-border-primary)] last:border-b-0">
-                      <div>
+                      <div class="min-w-0 flex-1">
                         <p class="text-sm font-semibold text-[var(--color-text-primary)]">{repo.full_name}</p>
                         <div class="flex items-center gap-3 mt-1 text-xs text-[var(--color-text-tertiary)]">
                           <span>Branch: {repo.default_branch}</span>
                           <span>Provider: {repo.provider}</span>
+                          <Show when={repo.clone_url}><span class="truncate max-w-xs" title={repo.clone_url}>{repo.clone_url}</span></Show>
                           <Show when={repo.last_sync_at}><span>Synced: {formatRelativeTime(repo.last_sync_at!)}</span></Show>
                         </div>
                       </div>
                       <div class="flex items-center gap-2">
+                        <Button size="sm" variant="outline" onClick={() => openEditRepo(repo)}>Edit</Button>
                         <Button size="sm" variant="ghost" onClick={() => handleSyncRepo(repo.id)}>Sync</Button>
                         <Button size="sm" variant="danger" onClick={() => handleDisconnectRepo(repo.id)}>Disconnect</Button>
                       </div>
@@ -335,6 +479,23 @@ const ProjectDetailPage: Component = () => {
                 </For>
               </Show>
             </Card>
+            <Show when={editingRepo()}>
+              <Modal open={!!editingRepo()} onClose={() => setEditingRepo(null)} title="Edit Repository" footer={
+                <><Button variant="ghost" onClick={() => setEditingRepo(null)}>Cancel</Button><Button onClick={handleSaveRepo} loading={savingRepo()} disabled={!repoFullName().trim() || !repoCloneUrl().trim()}>Save Changes</Button></>
+              }>
+                <div class="space-y-4">
+                  <Input label="Full Name" placeholder="owner/repo" value={repoFullName()} onInput={(e) => setRepoFullName(e.currentTarget.value)} />
+                  <Input label="Clone URL" placeholder="https://github.com/owner/repo.git" value={repoCloneUrl()} onInput={(e) => setRepoCloneUrl(e.currentTarget.value)} />
+                  <Input label="SSH URL (optional)" placeholder="git@github.com:owner/repo.git" value={repoSshUrl()} onInput={(e) => setRepoSshUrl(e.currentTarget.value)} />
+                  <Input label="Default Branch" placeholder="main" value={repoBranch()} onInput={(e) => setRepoBranch(e.currentTarget.value)} />
+                  <Select label="Provider" value={repoProvider()} onChange={(e) => setRepoProvider(e.currentTarget.value)} options={[
+                    { value: 'github', label: 'GitHub' },
+                    { value: 'gitlab', label: 'GitLab' },
+                    { value: 'bitbucket', label: 'Bitbucket' },
+                  ]} />
+                </div>
+              </Modal>
+            </Show>
           </Match>
 
           {/* Secrets */}
@@ -443,6 +604,42 @@ const ProjectDetailPage: Component = () => {
             </Show>
           </Match>
         </Switch>
+      </Show>
+
+      {/* Create Pipeline Modal */}
+      <Show when={showCreatePipeline()}>
+        <Modal open={showCreatePipeline()} onClose={() => setShowCreatePipeline(false)} title="Create Pipeline" description="Set up a new CI/CD pipeline" footer={
+          <><Button variant="ghost" onClick={() => setShowCreatePipeline(false)}>Cancel</Button><Button onClick={handleCreatePipeline} loading={creatingPipeline()} disabled={!newPipelineName().trim()}>Create Pipeline</Button></>
+        }>
+          <div class="space-y-4">
+            <Input label="Pipeline Name" placeholder="e.g. CI Pipeline" value={newPipelineName()} onInput={(e) => setNewPipelineName(e.currentTarget.value)} />
+            <Input label="Description" placeholder="Brief description..." value={newPipelineDesc()} onInput={(e) => setNewPipelineDesc(e.currentTarget.value)} />
+            <Select label="Configuration Source" value={newPipelineSource()} onChange={(e) => setNewPipelineSource(e.currentTarget.value)} options={[
+              { value: 'db', label: 'Database — Edit in UI' },
+              { value: 'repo', label: 'Repository — Read from .flowforge.yml' },
+            ]} />
+            <Show when={newPipelineSource() === 'repo'}>
+              <Input label="Config Path" value={newPipelineConfigPath()} onInput={(e) => setNewPipelineConfigPath(e.currentTarget.value)} hint="Path to the pipeline YAML file in the repository" />
+            </Show>
+          </div>
+        </Modal>
+      </Show>
+
+      {/* Trigger Pipeline Modal */}
+      <Show when={showTriggerPipeline()}>
+        <Modal open={showTriggerPipeline()} onClose={() => setShowTriggerPipeline(false)} title="Trigger Pipeline" description="Manually start a new pipeline run" footer={
+          <><Button variant="ghost" onClick={() => setShowTriggerPipeline(false)}>Cancel</Button><Button onClick={handleTriggerPipeline} loading={triggeringPipeline()}>Trigger Run</Button></>
+        }>
+          <div class="space-y-4">
+            <Show when={(data()?.pipelines ?? []).length > 1}>
+              <Select label="Pipeline" value={triggerPipelineId()} onChange={(e) => setTriggerPipelineId(e.currentTarget.value)} options={
+                (data()?.pipelines ?? []).map(p => ({ value: p.id, label: p.name }))
+              } />
+            </Show>
+            <Input label="Branch" value={triggerBranch()} onInput={(e) => setTriggerBranch(e.currentTarget.value)} placeholder="main" />
+            <p class="text-xs text-[var(--color-text-tertiary)]">The pipeline will execute against the latest commit on this branch.</p>
+          </div>
+        </Modal>
       </Show>
     </PageContainer>
   );

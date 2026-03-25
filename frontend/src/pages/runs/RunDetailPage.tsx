@@ -1,6 +1,6 @@
 import type { Component } from 'solid-js';
 import { createSignal, createResource, For, Show, onMount, onCleanup, createEffect } from 'solid-js';
-import { useParams, A } from '@solidjs/router';
+import { useParams, A, useNavigate } from '@solidjs/router';
 import PageContainer from '../../components/layout/PageContainer';
 import Badge from '../../components/ui/Badge';
 import Button from '../../components/ui/Button';
@@ -130,7 +130,9 @@ async function fetchRunData(ids: { projectId: string; pipelineId: string; runId:
 // ---------------------------------------------------------------------------
 const RunDetailPage: Component = () => {
 	const params = useParams<{ id: string; pid: string; rid: string }>();
+	const navigate = useNavigate();
 	const [selectedStep, setSelectedStep] = createSignal<string>('__all__');
+	const [logsCopied, setLogsCopied] = createSignal(false);
 	const [expandedStages, setExpandedStages] = createSignal<Set<string>>(new Set());
 	const [expandedJobs, setExpandedJobs] = createSignal<Set<string>>(new Set());
 	const [showArtifacts, setShowArtifacts] = createSignal(false);
@@ -225,6 +227,7 @@ const RunDetailPage: Component = () => {
 			});
 			logSocket.on('status', (payload: unknown) => {
 				const status = payload as { status?: string };
+				setLiveLogLines([]); // Clear live lines — refetch will load all from DB
 				refetch();
 				if (status.status === 'success' || status.status === 'failure' || status.status === 'cancelled') {
 					logSocket?.disconnect();
@@ -232,6 +235,7 @@ const RunDetailPage: Component = () => {
 				}
 			});
 			logSocket.on('status_change', () => {
+				setLiveLogLines([]); // Clear live lines — refetch will load all from DB
 				debouncedRefetch();
 			});
 			logSocket.on('replay_complete', () => {
@@ -285,30 +289,31 @@ const RunDetailPage: Component = () => {
 
 	const isAllLogsView = () => selectedStep() === '__all__';
 
-	// Get logs for selected step or all logs — returns LogEntry[] with stream info
+	// Get logs for selected step or all logs — returns LogEntry[] with stream info.
+	// Two sources: historical (REST API / DB) and live (WebSocket).
+	// On every refetch, liveLogLines is cleared so we never merge both.
+	// During streaming, live lines accumulate; on refetch, DB takes over.
 	const selectedStepLogEntries = (): LogEntry[] => {
 		const stepId = selectedStep();
 		if (!stepId) return [];
 
-		if (stepId === '__all__') {
-			const historicalEntries: LogEntry[] = allLogs().map(l => ({
-				content: l.content,
-				stream: l.stream || 'stdout',
-				step_run_id: l.step_run_id ?? '',
-			}));
-			const liveEntries = liveLogLines();
-			return [...historicalEntries, ...liveEntries];
-		}
+		const live = liveLogLines();
+		const historical = allLogs();
 
-		const stepLogs: LogEntry[] = allLogs()
-			.filter(l => l.step_run_id === stepId)
-			.map(l => ({
+		// Pick whichever source has data — prefer historical (authoritative),
+		// fall back to live lines during active streaming before first refetch.
+		const source = historical.length > 0
+			? historical.map(l => ({
 				content: l.content,
 				stream: l.stream || 'stdout',
 				step_run_id: l.step_run_id ?? '',
-			}));
-		const liveLinesForStep = liveLogLines().filter(l => l.step_run_id === stepId);
-		return [...stepLogs, ...liveLinesForStep];
+			}))
+			: live;
+
+		if (stepId === '__all__') {
+			return source;
+		}
+		return source.filter(l => l.step_run_id === stepId);
 	};
 
 	const handleCancel = async () => {
@@ -329,7 +334,7 @@ const RunDetailPage: Component = () => {
 		try {
 			const newRun = await api.runs.rerun(params.id, params.pid, params.rid);
 			toast.success(`Re-run started as #${newRun.number}`);
-			refetch();
+			navigate(`/projects/${params.id}/pipelines/${params.pid}/runs/${newRun.id}`);
 		} catch (err) {
 			toast.error(err instanceof ApiRequestError ? err.message : 'Failed to rerun');
 		} finally {
@@ -446,6 +451,45 @@ const RunDetailPage: Component = () => {
 					</div>
 				</Show>
 
+				{/* Failure summary banner */}
+				<Show when={run() && run()!.status === 'failure'}>
+					{(() => {
+						const failedSteps = steps().filter(s => s.status === 'failure');
+						return (
+							<Show when={failedSteps.length > 0}>
+								<div class="mb-6 p-4 rounded-xl bg-red-500/10 border border-red-500/30">
+									<div class="flex items-center gap-2 mb-2">
+										<svg class="w-5 h-5 text-red-400 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+											<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd" />
+										</svg>
+										<span class="text-sm font-semibold text-red-400">
+											{failedSteps.length === 1 ? '1 step failed' : `${failedSteps.length} steps failed`}
+										</span>
+									</div>
+									<div class="space-y-1.5 ml-7">
+										<For each={failedSteps}>
+											{(step) => (
+												<div
+													class="flex items-start gap-2 text-sm cursor-pointer hover:bg-red-500/5 rounded px-2 py-1 -mx-2 transition-colors"
+													onClick={() => setSelectedStep(step.id)}
+												>
+													<span class="font-mono text-red-300 font-medium flex-shrink-0">{step.name}</span>
+													<Show when={step.error_message}>
+														<span class="text-red-400/70">— {step.error_message}</span>
+													</Show>
+													<Show when={!step.error_message && step.exit_code !== undefined && step.exit_code !== 0}>
+														<span class="text-red-400/70">— exited with code {step.exit_code}</span>
+													</Show>
+												</div>
+											)}
+										</For>
+									</div>
+								</div>
+							</Show>
+						);
+					})()}
+				</Show>
+
 				{/* Artifacts panel */}
 				<Show when={showArtifacts() && artifacts().length > 0}>
 					<div class="mb-6 p-4 bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border-primary)]">
@@ -491,7 +535,7 @@ const RunDetailPage: Component = () => {
 									<path fill-rule="evenodd" d="M4.5 2A1.5 1.5 0 003 3.5v13A1.5 1.5 0 004.5 18h11a1.5 1.5 0 001.5-1.5V7.621a1.5 1.5 0 00-.44-1.06l-4.12-4.122A1.5 1.5 0 0011.378 2H4.5zm2.25 8.5a.75.75 0 000 1.5h6.5a.75.75 0 000-1.5h-6.5zm0 3a.75.75 0 000 1.5h6.5a.75.75 0 000-1.5h-6.5z" clip-rule="evenodd" />
 								</svg>
 								<span class={`text-sm font-medium flex-1 ${isAllLogsView() ? 'text-indigo-400' : 'text-[var(--color-text-primary)]'}`}>All Logs</span>
-								<span class="text-xs text-[var(--color-text-tertiary)]">{allLogs().length + liveLogLines().length}</span>
+								<span class="text-xs text-[var(--color-text-tertiary)]">{allLogs().length || liveLogLines().length}</span>
 							</button>
 
 							{/* Stream legend */}
@@ -549,19 +593,30 @@ const RunDetailPage: Component = () => {
 																			<div class="ml-4 pl-3 border-l border-[var(--color-border-primary)]">
 																				<For each={jobSteps()}>
 																					{(step) => (
-																						<button
-																							class={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors text-left ${selectedStep() === step.id
-																								? 'bg-indigo-500/10 border border-indigo-500/30'
-																								: 'hover:bg-[var(--color-bg-hover)]'
-																								}`}
-																							onClick={() => setSelectedStep(step.id)}
-																						>
-																							{statusIcon(step.status)}
-																							<span class={`text-xs flex-1 truncate ${selectedStep() === step.id ? 'text-indigo-400 font-medium' : 'text-[var(--color-text-tertiary)]'}`}>
-																								{step.name}
-																							</span>
-																							<span class="text-xs text-[var(--color-text-tertiary)]">{formatDuration(step.duration_ms)}</span>
-																						</button>
+																						<div>
+																							<button
+																								class={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors text-left ${selectedStep() === step.id
+																									? 'bg-indigo-500/10 border border-indigo-500/30'
+																									: 'hover:bg-[var(--color-bg-hover)]'
+																									}`}
+																								onClick={() => setSelectedStep(step.id)}
+																							>
+																								{statusIcon(step.status)}
+																								<span class={`text-xs flex-1 truncate ${selectedStep() === step.id ? 'text-indigo-400 font-medium' : 'text-[var(--color-text-tertiary)]'}`}>
+																									{step.name}
+																								</span>
+																								<span class="text-xs text-[var(--color-text-tertiary)]">{formatDuration(step.duration_ms)}</span>
+																							</button>
+																							<Show when={step.status === 'failure' && (step.error_message || (step.exit_code !== undefined && step.exit_code !== 0))}>
+																								<div
+																									class="ml-7 mr-2 mt-0.5 mb-1 px-2 py-1 text-xs text-red-400/80 bg-red-500/5 rounded border border-red-500/20 cursor-pointer truncate"
+																									title={step.error_message || `Exit code ${step.exit_code}`}
+																									onClick={() => setSelectedStep(step.id)}
+																								>
+																									{step.error_message || `Exit code ${step.exit_code}`}
+																								</div>
+																							</Show>
+																						</div>
 																					)}
 																				</For>
 																			</div>
@@ -608,6 +663,37 @@ const RunDetailPage: Component = () => {
 								</Show>
 								<Show when={!isAllLogsView() && selectedStepData()?.duration_ms}>
 									<span class="text-xs text-[var(--color-text-tertiary)]">{formatDuration(selectedStepData()?.duration_ms)}</span>
+								</Show>
+								<Show when={selectedStepLogEntries().length > 0}>
+									<button
+										class="flex items-center gap-1 px-2 py-1 text-xs rounded border border-[var(--color-border-primary)] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-secondary)] transition-colors"
+										onClick={() => {
+											const text = selectedStepLogEntries()
+												.map((l) => l.content)
+												.join('');
+											navigator.clipboard.writeText(text).then(() => {
+												setLogsCopied(true);
+												setTimeout(() => setLogsCopied(false), 2000);
+											});
+										}}
+									>
+										<Show when={logsCopied()} fallback={
+											<>
+												<svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
+													<path d="M7 3.5A1.5 1.5 0 018.5 2h3.879a1.5 1.5 0 011.06.44l3.122 3.12A1.5 1.5 0 0117 6.622V12.5a1.5 1.5 0 01-1.5 1.5h-1v-3.379a3 3 0 00-.879-2.121L10.5 5.379A3 3 0 008.379 4.5H7v-1z" />
+													<path d="M4.5 6A1.5 1.5 0 003 7.5v9A1.5 1.5 0 004.5 18h7a1.5 1.5 0 001.5-1.5v-5.879a1.5 1.5 0 00-.44-1.06L9.44 6.439A1.5 1.5 0 008.378 6H4.5z" />
+												</svg>
+												Copy
+											</>
+										}>
+											<>
+												<svg class="w-3.5 h-3.5 text-emerald-400" viewBox="0 0 20 20" fill="currentColor">
+													<path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clip-rule="evenodd" />
+												</svg>
+												Copied!
+											</>
+										</Show>
+									</button>
 								</Show>
 							</div>
 						</div>

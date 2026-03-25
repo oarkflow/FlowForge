@@ -73,6 +73,7 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	// Repositories
 	projects.Get("/:id/repositories", h.ListRepositories)
 	projects.Post("/:id/repositories", middleware.RequireDev(), h.CreateRepository)
+	projects.Put("/:id/repositories/:repoId", middleware.RequireDev(), h.UpdateRepository)
 	projects.Delete("/:id/repositories/:repoId", middleware.RequireAdmin(), h.DeleteRepository)
 	projects.Post("/:id/repositories/:repoId/sync", middleware.RequireDev(), h.SyncRepository)
 

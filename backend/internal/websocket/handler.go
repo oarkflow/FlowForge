@@ -55,8 +55,11 @@ func (h *Handler) HandleRunLogs(c fiber.Ctx) error {
 			h.hub.Unregister <- client
 		}()
 
-		// Replay existing logs on connect
-		h.replayLogs(conn, runID)
+		// NOTE: We intentionally do NOT replay existing logs here.
+		// The frontend fetches historical logs via the REST API.
+		// The WebSocket is only for LIVE logs that arrive after connection.
+		// Replaying would cause duplicates since the REST response and
+		// replay would overlap.
 
 		// Write pump: send messages from hub to WebSocket
 		done := make(chan struct{})

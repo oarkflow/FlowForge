@@ -143,14 +143,14 @@ func (s *Scheduler) dispatch(ctx context.Context, job *queue.Job) {
 	if err := json.Unmarshal(job.Config, &config); err != nil {
 		errMsg := fmt.Sprintf("scheduler: failed to parse pipeline config: %v", err)
 		log.Error().Str("run_id", runID).Msg(errMsg)
-		s.finishRun(ctx, runID, "failure", 0)
+		s.finishRun(ctx, runID, "failure", 0, errMsg)
 		return
 	}
 
 	// Execute the pipeline via the registered run function
 	if s.runFn == nil {
 		log.Error().Str("run_id", runID).Msg("scheduler: no run function registered")
-		s.finishRun(ctx, runID, "failure", 0)
+		s.finishRun(ctx, runID, "failure", 0, "no run function registered")
 		return
 	}
 
@@ -160,16 +160,16 @@ func (s *Scheduler) dispatch(ctx context.Context, job *queue.Job) {
 
 	if err != nil {
 		log.Error().Err(err).Str("run_id", runID).Msg("scheduler: pipeline run failed")
-		s.finishRun(ctx, runID, "failure", durationMs)
+		s.finishRun(ctx, runID, "failure", durationMs, err.Error())
 		return
 	}
 
-	s.finishRun(ctx, runID, "success", durationMs)
+	s.finishRun(ctx, runID, "success", durationMs, "")
 }
 
 // finishRun updates the pipeline run status and broadcasts the result.
-func (s *Scheduler) finishRun(ctx context.Context, runID, status string, durationMs int) {
-	if err := s.repos.Runs.SetFinished(ctx, runID, status, durationMs); err != nil {
+func (s *Scheduler) finishRun(ctx context.Context, runID, status string, durationMs int, errorSummary string) {
+	if err := s.repos.Runs.SetFinished(ctx, runID, status, durationMs, errorSummary); err != nil {
 		log.Error().Err(err).Str("run_id", runID).Msg("scheduler: failed to update run status")
 	}
 	s.broadcastStatus(runID, status)

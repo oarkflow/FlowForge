@@ -750,6 +750,55 @@ func (h *Handler) DeleteRepository(c fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "repository deleted"})
 }
 
+type updateRepoInput struct {
+	FullName      *string `json:"full_name"`
+	CloneURL      *string `json:"clone_url"`
+	SSHURL        *string `json:"ssh_url"`
+	DefaultBranch *string `json:"default_branch"`
+	Provider      *string `json:"provider"`
+	ProviderID    *string `json:"provider_id"`
+}
+
+func (h *Handler) UpdateRepository(c fiber.Ctx) error {
+	repoID := c.Params("repoId")
+	repo, err := h.repo.Repos.GetByID(c.Context(), repoID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "repository not found")
+	}
+
+	var input updateRepoInput
+	if err := c.Bind().JSON(&input); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
+	}
+
+	if input.FullName != nil && *input.FullName != "" {
+		repo.FullName = *input.FullName
+	}
+	if input.CloneURL != nil && *input.CloneURL != "" {
+		repo.CloneURL = *input.CloneURL
+	}
+	if input.SSHURL != nil {
+		repo.SSHURL = input.SSHURL
+	}
+	if input.DefaultBranch != nil && *input.DefaultBranch != "" {
+		repo.DefaultBranch = *input.DefaultBranch
+	}
+	if input.Provider != nil && *input.Provider != "" {
+		repo.Provider = *input.Provider
+	}
+	if input.ProviderID != nil {
+		repo.ProviderID = *input.ProviderID
+	}
+
+	if err := h.repo.Repos.Update(c.Context(), repo); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to update repository: "+err.Error())
+	}
+
+	_ = h.audit.LogAction(c.Context(), getUserID(c), getClientIP(c), "update", "repository", repoID, input)
+
+	return c.JSON(repo)
+}
+
 func (h *Handler) SyncRepository(c fiber.Ctx) error {
 	repoID := c.Params("repoId")
 	repo, err := h.repo.Repos.GetByID(c.Context(), repoID)

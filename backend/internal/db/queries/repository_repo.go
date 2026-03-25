@@ -40,3 +40,10 @@ func (r *RepositoryRepo) Delete(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, "DELETE FROM repositories WHERE id = ?", id)
 	return err
 }
+
+func (r *RepositoryRepo) Update(ctx context.Context, repo *models.Repository) error {
+	_, err := r.db.NamedExecContext(ctx,
+		`UPDATE repositories SET full_name=:full_name, clone_url=:clone_url, ssh_url=:ssh_url, default_branch=:default_branch, provider=:provider, provider_id=:provider_id, is_active=:is_active WHERE id=:id`,
+		repo)
+	return err
+}

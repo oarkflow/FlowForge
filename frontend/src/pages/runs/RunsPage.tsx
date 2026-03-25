@@ -183,6 +183,9 @@ const RunsPage: Component = () => {
               {' '}&mdash; {row.commit_message}
             </Show>
           </div>
+          <Show when={row.status === 'failure' && row.error_summary}>
+            <div class="text-xs text-red-400/80 mt-0.5 truncate max-w-xs" title={row.error_summary}>{row.error_summary}</div>
+          </Show>
         </div>
       ),
     },

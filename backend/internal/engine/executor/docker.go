@@ -18,10 +18,23 @@ import (
 
 // DockerExecutor runs steps inside Docker containers using the Docker Engine API
 // directly via HTTP over a Unix socket, avoiding the need for the full Docker SDK.
+//
+// Each step gets its own short-lived container but all steps within a job share
+// a single Docker named volume mounted at /workspace so that files (checked-out
+// source, build artifacts, etc.) persist across steps.
 type DockerExecutor struct {
 	client     *http.Client
 	socketPath string
 	mu         sync.Mutex
+
+	// WorkspaceVolume is the name of a Docker volume that will be mounted
+	// at /workspace in every container created by this executor. The runner
+	// creates the volume before the first step and removes it after the last.
+	WorkspaceVolume string
+
+	// pulledImages tracks images already pulled in this executor's lifetime
+	// to avoid redundant pulls within the same job.
+	pulledImages map[string]bool
 }
 
 // NewDockerExecutor creates a new DockerExecutor.
@@ -44,7 +57,33 @@ func NewDockerExecutor() *DockerExecutor {
 			Transport: transport,
 			Timeout:   0, // No timeout; we use context for cancellation
 		},
-		socketPath: socketPath,
+		socketPath:   socketPath,
+		pulledImages: make(map[string]bool),
+	}
+}
+
+// CreateVolume creates a Docker named volume. Call this once per job before
+// executing steps, then set WorkspaceVolume to the returned name.
+func (e *DockerExecutor) CreateVolume(ctx context.Context, name string) error {
+	body := map[string]string{"Name": name}
+	resp, err := e.dockerRequest(ctx, "POST", "/v1.43/volumes/create", body)
+	if err != nil {
+		return fmt.Errorf("create volume: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("create volume failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// RemoveVolume removes a Docker named volume. Call this after all steps finish.
+func (e *DockerExecutor) RemoveVolume(ctx context.Context, name string) {
+	resp, err := e.dockerRequest(ctx, "DELETE", fmt.Sprintf("/v1.43/volumes/%s?force=true", name), nil)
+	if err == nil {
+		resp.Body.Close()
 	}
 }
 
@@ -76,6 +115,8 @@ func (e *DockerExecutor) Execute(ctx context.Context, step ExecutionStep) (*Exec
 }
 
 // ExecuteWithLogs runs a command in a Docker container, streaming output via logWriter.
+// If WorkspaceVolume is set, the volume is mounted at /workspace so files persist
+// across steps within the same job.
 func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, step ExecutionStep, logWriter LogWriter) (*ExecutionResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -91,9 +132,12 @@ func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, step ExecutionStep
 		image = "alpine:latest"
 	}
 
-	// Pull image
-	if err := e.pullImage(ctx, image, step.Env["FLOWFORGE_DOCKER_REGISTRY_AUTH"], logWriter); err != nil {
-		return nil, fmt.Errorf("pull image %s: %w", image, err)
+	// Pull image (skip if already pulled in this job)
+	if !e.pulledImages[image] {
+		if err := e.pullImage(ctx, image, step.Env["FLOWFORGE_DOCKER_REGISTRY_AUTH"], logWriter); err != nil {
+			return nil, fmt.Errorf("pull image %s: %w", image, err)
+		}
+		e.pulledImages[image] = true
 	}
 
 	// Build container config
@@ -159,24 +203,24 @@ func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, step ExecutionStep
 
 // dockerContainerConfig represents the Docker container creation request.
 type dockerContainerConfig struct {
-	Image        string              `json:"Image"`
-	Cmd          []string            `json:"Cmd"`
-	Env          []string            `json:"Env,omitempty"`
-	WorkingDir   string              `json:"WorkingDir,omitempty"`
-	HostConfig   dockerHostConfig    `json:"HostConfig,omitempty"`
-	NetworkMode  string              `json:"NetworkMode,omitempty"`
-	AttachStdout bool                `json:"AttachStdout"`
-	AttachStderr bool                `json:"AttachStderr"`
-	Tty          bool                `json:"Tty"`
+	Image        string           `json:"Image"`
+	Cmd          []string         `json:"Cmd"`
+	Env          []string         `json:"Env,omitempty"`
+	WorkingDir   string           `json:"WorkingDir,omitempty"`
+	HostConfig   dockerHostConfig `json:"HostConfig,omitempty"`
+	NetworkMode  string           `json:"NetworkMode,omitempty"`
+	AttachStdout bool             `json:"AttachStdout"`
+	AttachStderr bool             `json:"AttachStderr"`
+	Tty          bool             `json:"Tty"`
 }
 
 type dockerHostConfig struct {
-	Binds        []string           `json:"Binds,omitempty"`
-	Privileged   bool               `json:"Privileged,omitempty"`
-	NetworkMode  string             `json:"NetworkMode,omitempty"`
-	NanoCPUs     int64              `json:"NanoCpus,omitempty"`
-	Memory       int64              `json:"Memory,omitempty"`
-	ExtraHosts   []string           `json:"ExtraHosts,omitempty"`
+	Binds       []string `json:"Binds,omitempty"`
+	Privileged  bool     `json:"Privileged,omitempty"`
+	NetworkMode string   `json:"NetworkMode,omitempty"`
+	NanoCPUs    int64    `json:"NanoCpus,omitempty"`
+	Memory      int64    `json:"Memory,omitempty"`
+	ExtraHosts  []string `json:"ExtraHosts,omitempty"`
 }
 
 func (e *DockerExecutor) buildContainerConfig(step ExecutionStep, image string) dockerContainerConfig {
@@ -201,8 +245,24 @@ func (e *DockerExecutor) buildContainerConfig(step ExecutionStep, image string) 
 
 	// Bind mounts
 	var binds []string
-	if step.WorkDir != "" {
+
+	// Mount the shared workspace volume for cross-step file persistence.
+	// This is the key mechanism: all steps in a job share this volume at
+	// /workspace, so checkout files persist for build/test steps.
+	if e.WorkspaceVolume != "" {
+		binds = append(binds, e.WorkspaceVolume+":/workspace")
+	} else if step.WorkDir != "" {
+		// Fallback: bind-mount a host directory
 		binds = append(binds, step.WorkDir+":/workspace")
+	}
+
+	// If the repo clone URL is a local path, bind-mount it into the container
+	// at /mnt/source so the checkout action can copy from it.
+	if repoURL := step.Env["FLOWFORGE_REPO_CLONE_URL"]; repoURL != "" {
+		if strings.HasPrefix(repoURL, "/") || strings.HasPrefix(repoURL, "./") || strings.HasPrefix(repoURL, "../") {
+			mountPath := repoURL
+			binds = append(binds, mountPath+":/mnt/source:ro")
+		}
 	}
 
 	// Mount Docker socket if requested (for DinD)
@@ -403,7 +463,11 @@ func (e *DockerExecutor) stopContainer(ctx context.Context, containerID string) 
 }
 
 func (e *DockerExecutor) removeContainer(ctx context.Context, containerID string) {
-	path := fmt.Sprintf("/v1.43/containers/%s?force=true&v=true", containerID)
+	// NOTE: Do NOT use v=true here. That flag removes anonymous volumes
+	// associated with the container, which is unnecessary (named workspace
+	// volumes are cleaned up explicitly via RemoveVolume) and risky (could
+	// interfere with bind-mounted source directories in edge cases).
+	path := fmt.Sprintf("/v1.43/containers/%s?force=true", containerID)
 	resp, err := e.dockerRequest(ctx, "DELETE", path, nil)
 	if err == nil {
 		resp.Body.Close()

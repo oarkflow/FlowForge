@@ -247,6 +247,8 @@ export const api = {
     list: (projectId: string) => apiClient.get<Repository[]>(`/projects/${projectId}/repositories`),
     connect: (projectId: string, data: Partial<Repository>) =>
       apiClient.post<Repository>(`/projects/${projectId}/repositories`, data),
+    update: (projectId: string, repoId: string, data: Partial<Repository>) =>
+      apiClient.put<Repository>(`/projects/${projectId}/repositories/${repoId}`, data),
     disconnect: (projectId: string, repoId: string) =>
       apiClient.delete<void>(`/projects/${projectId}/repositories/${repoId}`),
     sync: (projectId: string, repoId: string) =>

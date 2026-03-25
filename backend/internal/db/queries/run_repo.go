@@ -74,8 +74,12 @@ func (r *RunRepo) SetStarted(ctx context.Context, id string) error {
 	return err
 }
 
-func (r *RunRepo) SetFinished(ctx context.Context, id, status string, durationMs int) error {
+func (r *RunRepo) SetFinished(ctx context.Context, id, status string, durationMs int, errorSummary string) error {
 	now := time.Now()
+	if errorSummary != "" {
+		_, err := r.db.ExecContext(ctx, "UPDATE pipeline_runs SET status = ?, finished_at = ?, duration_ms = ?, error_summary = ? WHERE id = ?", status, now, durationMs, errorSummary, id)
+		return err
+	}
 	_, err := r.db.ExecContext(ctx, "UPDATE pipeline_runs SET status = ?, finished_at = ?, duration_ms = ? WHERE id = ?", status, now, durationMs, id)
 	return err
 }

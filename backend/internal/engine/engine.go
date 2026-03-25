@@ -14,6 +14,7 @@ import (
 
 	"github.com/oarkflow/deploy/backend/internal/config"
 	"github.com/oarkflow/deploy/backend/internal/db/queries"
+	"github.com/oarkflow/deploy/backend/internal/detector"
 	"github.com/oarkflow/deploy/backend/internal/engine/queue"
 	"github.com/oarkflow/deploy/backend/internal/engine/scheduler"
 	"github.com/oarkflow/deploy/backend/internal/models"
@@ -180,12 +181,39 @@ func (e *Engine) TriggerPipeline(ctx context.Context, pipelineID, triggerType st
 // buildPipelineConfig converts the pipeline's stored config into a scheduler.PipelineConfig.
 // It supports both the FlowForge YAML DSL and direct JSON scheduler config.
 // It also injects repository context (clone URL, branch) into step env vars.
+//
+// For pipelines linked to a local repository, it re-runs detection on every
+// trigger so that changes in autogen.go (e.g. updated Docker images) take
+// effect immediately without requiring the user to manually update the config.
 func (e *Engine) buildPipelineConfig(ctx context.Context, p *models.Pipeline, triggerData map[string]string) scheduler.PipelineConfig {
-	if p.ConfigContent == nil || *p.ConfigContent == "" {
-		return defaultPipelineConfig()
+	content := ""
+	if p.ConfigContent != nil {
+		content = *p.ConfigContent
 	}
 
-	content := *p.ConfigContent
+	// If the pipeline has a linked repository with a local path, re-detect
+	// the stack and regenerate the config. This ensures updated Docker images
+	// and build commands take effect without manual config edits.
+	if p.RepositoryID != nil && *p.RepositoryID != "" {
+		repo, err := e.repos.Repos.GetByID(ctx, *p.RepositoryID)
+		if err == nil && isLocalPath(repo.CloneURL) {
+			results, detectErr := detector.Detect(repo.CloneURL)
+			if detectErr == nil && len(results) > 0 {
+				newYAML := detector.GenerateStarterPipeline(results)
+				log.Info().Str("pipeline_id", p.ID).Msg("engine: regenerated pipeline config from local repo detection")
+				content = newYAML
+				// Persist the updated config so future views in the UI reflect the change
+				p.ConfigContent = &newYAML
+				now := time.Now()
+				p.UpdatedAt = now
+				_ = e.repos.Pipelines.Update(ctx, p)
+			}
+		}
+	}
+
+	if content == "" {
+		return defaultPipelineConfig()
+	}
 
 	// 1. Try direct JSON unmarshal into scheduler.PipelineConfig (for configs stored as scheduler JSON)
 	var direct scheduler.PipelineConfig
@@ -260,38 +288,111 @@ func resolveAction(uses string, with map[string]string) string {
 
 	switch action {
 	case "checkout":
-		// Clone the repository. Relies on FLOWFORGE_REPO_CLONE_URL and
-		// FLOWFORGE_REPO_BRANCH being set in the step env by the config builder.
+		// Clone the repository or copy a local folder. Relies on
+		// FLOWFORGE_REPO_CLONE_URL and FLOWFORGE_REPO_BRANCH being set in the
+		// step env by the config builder. Handles three cases:
+		//  1. Local folder WITHOUT .git → copy contents (cp -a)
+		//  2. Local folder WITH .git → git clone (file:// protocol)
+		//  3. Remote URL (https:// or git@) → git clone
 		return `set -e
-# Install git if not available (common in Alpine-based images)
-if ! command -v git >/dev/null 2>&1; then
-  if command -v apk >/dev/null 2>&1; then
-    apk add --no-cache git >/dev/null 2>&1
-  elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q git >/dev/null 2>&1
-  fi
-fi
 REPO_URL="${INPUT_REPOSITORY:-${FLOWFORGE_REPO_CLONE_URL:-}}"
 BRANCH="${INPUT_BRANCH:-${FLOWFORGE_REPO_BRANCH:-main}}"
 DEPTH="${INPUT_DEPTH:-1}"
-if [ -z "$REPO_URL" ]; then
-  echo "Checkout: No repository URL configured — skipping git clone"
-  echo "Working directory: $(pwd)"
+
+# Skip checkout if workspace already has files (shared volume from prior stage)
+FILE_COUNT=$(ls -1A /workspace 2>/dev/null | wc -l)
+if [ "$FILE_COUNT" -gt 0 ]; then
+  echo "Workspace already has $FILE_COUNT entries — skipping checkout"
   ls -la
   exit 0
 fi
-echo "Cloning $REPO_URL (branch: $BRANCH, depth: $DEPTH)"
-if [ -d ".git" ]; then
-  echo "Repository already present, fetching latest..."
-  git fetch --depth="$DEPTH" origin "$BRANCH"
-  git checkout FETCH_HEAD
-else
-  git clone --depth="$DEPTH" --branch "$BRANCH" --single-branch "$REPO_URL" .
+
+if [ -z "$REPO_URL" ]; then
+  echo "Checkout: No repository URL configured — skipping"
+  echo "Working directory: $(pwd)"
+  ls -la 2>/dev/null || true
+  exit 0
 fi
-echo "Checked out $(git rev-parse --short HEAD) on $BRANCH"
-ls -la`
+
+# Helper: copy all files (including hidden) from $1 into current directory
+copy_source() {
+  SRC="$1"
+  echo "Copying files from $SRC to $(pwd) ..."
+  # Use find + cp to reliably copy all files including hidden ones
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "$SRC/" ./
+  else
+    # tar pipe is the most reliable cross-platform approach
+    (cd "$SRC" && tar cf - .) | tar xf -
+  fi
+  COUNT=$(ls -1A | wc -l)
+  echo "Copied $COUNT entries to workspace"
+}
+
+# Determine if this is a local path or remote URL
+IS_LOCAL=false
+LOCAL_PATH=""
+case "$REPO_URL" in
+  /*) IS_LOCAL=true; LOCAL_PATH="$REPO_URL" ;;
+  ./*|../*) IS_LOCAL=true; LOCAL_PATH="$REPO_URL" ;;
+esac
+
+if [ "$IS_LOCAL" = "true" ]; then
+  if [ ! -e "$LOCAL_PATH" ]; then
+    # Inside a container, local paths are mounted at /mnt/source
+    if [ -e "/mnt/source" ]; then
+      echo "Using bind-mounted source from /mnt/source"
+      echo "Source contents:"
+      ls -la /mnt/source/ | head -20
+      copy_source /mnt/source
+      echo "Workspace after copy:"
+      ls -la
+      exit 0
+    fi
+    echo "Warning: Local path '$LOCAL_PATH' not found — skipping checkout"
+    exit 0
+  fi
+  if [ -d "$LOCAL_PATH/.git" ]; then
+    # Local git repo — clone it
+    echo "Cloning local git repository: $LOCAL_PATH (branch: $BRANCH)"
+    if ! command -v git >/dev/null 2>&1; then
+      if command -v apk >/dev/null 2>&1; then apk add --no-cache git >/dev/null 2>&1
+      elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1
+      elif command -v yum >/dev/null 2>&1; then yum install -y -q git >/dev/null 2>&1; fi
+    fi
+    if command -v git >/dev/null 2>&1; then
+      git clone --depth="$DEPTH" --branch "$BRANCH" --single-branch "file://$LOCAL_PATH" . 2>&1 || \
+        git clone "file://$LOCAL_PATH" . 2>&1 || \
+        { echo "git clone failed, falling back to copy"; copy_source "$LOCAL_PATH"; }
+    else
+      echo "git not available, copying files from $LOCAL_PATH"
+      copy_source "$LOCAL_PATH"
+    fi
+  else
+    # Local directory without git — just copy the files
+    echo "Copying local source from: $LOCAL_PATH"
+    copy_source "$LOCAL_PATH"
+  fi
+  echo "Source files ready in workspace"
+  ls -la
+else
+  # Remote URL — use git clone
+  echo "Cloning $REPO_URL (branch: $BRANCH, depth: $DEPTH)"
+  if ! command -v git >/dev/null 2>&1; then
+    if command -v apk >/dev/null 2>&1; then apk add --no-cache git >/dev/null 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then yum install -y -q git >/dev/null 2>&1; fi
+  fi
+  if [ -d ".git" ]; then
+    echo "Repository already present, fetching latest..."
+    git fetch --depth="$DEPTH" origin "$BRANCH"
+    git checkout FETCH_HEAD
+  else
+    git clone --depth="$DEPTH" --branch "$BRANCH" --single-branch "$REPO_URL" .
+  fi
+  echo "Checked out $(git rev-parse --short HEAD 2>/dev/null || echo 'N/A') on $BRANCH"
+  ls -la
+fi`
 
 	case "upload-artifact":
 		name := with["name"]
@@ -492,6 +593,14 @@ func specToSchedulerConfig(spec *pipeline.PipelineSpec) scheduler.PipelineConfig
 				env["FLOWFORGE_DOCKER_IMAGE"] = jobImage
 			}
 
+			// Propagate privileged mode: mount the host Docker socket so
+			// the container can run docker/docker-compose commands against
+			// the host daemon (no DinD required).
+			if executorType == "docker" && jobSpec.Privileged {
+				env["FLOWFORGE_DOCKER_MOUNT_DOCKER_SOCKET"] = "true"
+				env["FLOWFORGE_DOCKER_PRIVILEGED"] = "true"
+			}
+
 			steps = append(steps, scheduler.StepConfig{
 				Name:    name,
 				Command: cmd,
@@ -542,7 +651,7 @@ func defaultPipelineConfig() scheduler.PipelineConfig {
 				Jobs: []scheduler.JobConfig{
 					{
 						Name:         "build",
-						ExecutorType: "local",
+						ExecutorType: "docker",
 						Steps: []scheduler.StepConfig{
 							{
 								Name:    "echo",
@@ -575,6 +684,11 @@ func determinePriority(triggerType string) int {
 	default:
 		return 50
 	}
+}
+
+// isLocalPath returns true if the URL looks like a local filesystem path.
+func isLocalPath(url string) bool {
+	return strings.HasPrefix(url, "/") || strings.HasPrefix(url, "./") || strings.HasPrefix(url, "../")
 }
 
 // Queue returns the engine's priority queue (for external inspection or testing).

@@ -2,6 +2,7 @@ package importer
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ const sessionTTL = 30 * time.Minute
 type session struct {
 	ID        string
 	WorkDir   string
+	Ephemeral bool // true when WorkDir is a FlowForge temp dir that we created and should clean up
 	CreatedAt time.Time
 }
 
@@ -35,6 +37,12 @@ func NewSessionStore() *SessionStore {
 	return s
 }
 
+// isTempDir returns true when the path looks like a FlowForge-managed temp
+// directory that is safe to remove.
+func isTempDir(path string) bool {
+	return strings.Contains(path, "flowforge-import-") || strings.Contains(path, "flowforge-upload-")
+}
+
 // Create stores a working directory and returns a session ID.
 func (s *SessionStore) Create(workDir string) string {
 	id := uuid.New().String()
@@ -42,6 +50,7 @@ func (s *SessionStore) Create(workDir string) string {
 	s.sessions[id] = &session{
 		ID:        id,
 		WorkDir:   workDir,
+		Ephemeral: isTempDir(workDir),
 		CreatedAt: time.Now(),
 	}
 	s.mu.Unlock()
@@ -63,7 +72,8 @@ func (s *SessionStore) Get(id string) string {
 	return sess.WorkDir
 }
 
-// Remove deletes a session and cleans up its working directory.
+// Remove deletes a session and cleans up its working directory ONLY if it is
+// a FlowForge-managed temp directory. User-owned local paths are NEVER deleted.
 func (s *SessionStore) Remove(id string) {
 	s.mu.Lock()
 	sess, ok := s.sessions[id]
@@ -72,7 +82,7 @@ func (s *SessionStore) Remove(id string) {
 	}
 	s.mu.Unlock()
 
-	if ok && sess.WorkDir != "" {
+	if ok && sess.Ephemeral && sess.WorkDir != "" {
 		os.RemoveAll(sess.WorkDir)
 	}
 }
@@ -104,7 +114,8 @@ func (s *SessionStore) sweep() {
 	now := time.Now()
 	for id, sess := range s.sessions {
 		if now.Sub(sess.CreatedAt) > sessionTTL {
-			if sess.WorkDir != "" {
+			// Only remove temp directories we created — never user-owned paths.
+			if sess.Ephemeral && sess.WorkDir != "" {
 				os.RemoveAll(sess.WorkDir)
 			}
 			delete(s.sessions, id)

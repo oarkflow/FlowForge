@@ -17,6 +17,7 @@ type PipelineRun struct {
 	StartedAt     *time.Time `db:"started_at" json:"started_at,omitempty"`
 	FinishedAt    *time.Time `db:"finished_at" json:"finished_at,omitempty"`
 	DurationMs    *int       `db:"duration_ms" json:"duration_ms,omitempty"`
+	ErrorSummary  *string    `db:"error_summary" json:"error_summary,omitempty"`
 	CreatedBy     *string    `db:"created_by" json:"created_by,omitempty"`
 	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
 }

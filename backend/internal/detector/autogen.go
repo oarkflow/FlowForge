@@ -100,6 +100,19 @@ func generateGoPipeline(r DetectionResult) string {
 					},
 				},
 			},
+			{
+				Name: "package",
+				Jobs: []jobTemplate{
+					{
+						Name:       "docker-build",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
+						},
+					},
+				},
+			},
 		},
 	})
 }
@@ -111,19 +124,19 @@ func generateNodePipeline(r DetectionResult) string {
 	}
 	image := fmt.Sprintf("node:%s-alpine", nodeVersion)
 
-	installCmd := "npm ci"
+	installCmd := "npm install"
 	testCmd := "npm test"
 	buildCmd := "npm run build"
 	lintCmd := "npm run lint"
 
 	switch r.BuildTool {
 	case "pnpm":
-		installCmd = "corepack enable && pnpm install --frozen-lockfile"
-		testCmd = "pnpm test"
-		buildCmd = "pnpm build"
-		lintCmd = "pnpm lint"
+		installCmd = "corepack enable && pnpm install"
+		testCmd = "corepack enable && pnpm test"
+		buildCmd = "corepack enable && pnpm build"
+		lintCmd = "corepack enable && pnpm lint"
 	case "yarn":
-		installCmd = "yarn install --frozen-lockfile"
+		installCmd = "yarn install"
 		testCmd = "yarn test"
 		buildCmd = "yarn build"
 		lintCmd = "yarn lint"
@@ -183,6 +196,19 @@ func generateNodePipeline(r DetectionResult) string {
 						Name: "build",
 						Steps: []stepTemplate{
 							{Name: "Build project", Run: buildCmd},
+						},
+					},
+				},
+			},
+			{
+				Name: "package",
+				Jobs: []jobTemplate{
+					{
+						Name:       "docker-build",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
 						},
 					},
 				},
@@ -323,6 +349,19 @@ func generateJavaPipeline(r DetectionResult) string {
 						Name: "build",
 						Steps: []stepTemplate{
 							{Name: "Build project", Run: buildCmd[0]},
+						},
+					},
+				},
+			},
+			{
+				Name: "package",
+				Jobs: []jobTemplate{
+					{
+						Name:       "docker-build",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
 						},
 					},
 				},
@@ -513,24 +552,26 @@ func generateSwiftPipeline(r DetectionResult) string {
 	})
 }
 
-// scalaJDKImage maps a Scala version to an appropriate JDK Docker image.
+// scalaJDKImage maps a Scala version to an appropriate Docker image that
+// includes both the JDK and sbt. The eclipse-temurin images only have the JDK
+// and lack sbt, so we use the sbtscala/scala-sbt images instead.
+//
+// Tag format: eclipse-temurin-{jdk_version}_{build}_{sbt_version}_{scala_version}
+// See https://hub.docker.com/r/sbtscala/scala-sbt/tags for available tags.
 func scalaJDKImage(scalaVersion string) string {
 	if scalaVersion == "" {
-		return "eclipse-temurin:17-jdk"
-	}
-	if strings.HasPrefix(scalaVersion, "2.10.") || strings.HasPrefix(scalaVersion, "2.11.") {
-		return "eclipse-temurin:8-jdk"
+		return "sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_3.3.7"
 	}
 	if strings.HasPrefix(scalaVersion, "2.12.") {
-		return "eclipse-temurin:11-jdk"
+		return "sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_2.12.21"
 	}
 	if strings.HasPrefix(scalaVersion, "2.13.") {
-		return "eclipse-temurin:17-jdk"
+		return "sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_2.13.18"
 	}
 	if strings.HasPrefix(scalaVersion, "3.") {
-		return "eclipse-temurin:21-jdk"
+		return "sbtscala/scala-sbt:eclipse-temurin-21.0.8_9_1.12.7_3.3.7"
 	}
-	return "eclipse-temurin:17-jdk"
+	return "sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_3.3.7"
 }
 
 func generateScalaPipeline(results []DetectionResult, r DetectionResult) string {
@@ -602,7 +643,7 @@ func generateScalaPipeline(results []DetectionResult, r DetectionResult) string 
 					CacheKey:   `node-modules-{{ hash "package-lock.json" }}`,
 					CachePaths: []string{"node_modules"},
 					Steps: []stepTemplate{
-						{Name: "Install dependencies", Run: "cd frontend && npm ci"},
+						{Name: "Install dependencies", Run: "cd frontend && npm install"},
 						{Name: "Build frontend", Run: "cd frontend && npm run build"},
 						{Name: "Upload frontend build", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "frontend-build", "path": "frontend/build"}},
 					},
@@ -611,29 +652,91 @@ func generateScalaPipeline(results []DetectionResult, r DetectionResult) string 
 		})
 	}
 
-	// Package stage.
+	// Package stage — build Docker image using host Docker socket (no DinD).
+	// The container runs docker:26-cli with privileged mode which mounts
+	// /var/run/docker.sock, so docker build/push work against the host daemon.
 	stages = append(stages, stageTemplate{
 		Name: "package",
 		Jobs: []jobTemplate{
 			{
-				Name:  "docker-build",
-				Image: "docker:26-dind",
+				Name:       "docker-build",
+				Image:      "docker:26-cli",
+				Privileged: true,
 				Steps: []stepTemplate{
-					{Name: "Build Docker image", Run: "docker build -t app:latest ."},
+					{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
+					{Name: "List images", Run: "docker images | head -20"},
 				},
 			},
 		},
 	})
 
-	// Deploy stage.
+	// Deploy stage — example using AWS Elastic Beanstalk for Scala fat-jar / WAR.
+	// Uses the AWS CLI image to upload the artifact and deploy.
+	// Requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION
+	// to be configured as project secrets.
 	stages = append(stages, stageTemplate{
 		Name: "deploy",
 		Jobs: []jobTemplate{
 			{
-				Name:  "deploy",
-				Image: jdkImage,
+				Name:  "deploy-eb",
+				Image: "amazon/aws-cli:latest",
 				Steps: []stepTemplate{
-					{Name: "Deploy", Run: "echo 'Configure deployment target in flowforge.yml'"},
+					{Name: "Deploy to Elastic Beanstalk", Run: `echo "=== Deploying to AWS Elastic Beanstalk ==="
+# Ensure EB CLI deps are available
+yum install -y -q zip >/dev/null 2>&1 || true
+
+APP_NAME="${AWS_EB_APP_NAME:-my-scala-app}"
+ENV_NAME="${AWS_EB_ENV_NAME:-my-scala-app-env}"
+REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+VERSION_LABEL="v$(date +%Y%m%d%H%M%S)"
+
+# Find the built artifact (fat jar or WAR)
+JAR_FILE=$(find target/ -maxdepth 2 -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
+if [ -z "$JAR_FILE" ]; then
+  echo "No JAR found in target/, looking for WAR..."
+  JAR_FILE=$(find target/ -maxdepth 2 -name "*.war" | head -1)
+fi
+
+if [ -z "$JAR_FILE" ]; then
+  echo "Error: No deployable artifact (JAR/WAR) found in target/"
+  ls -la target/ 2>/dev/null
+  exit 1
+fi
+
+echo "Deploying artifact: $JAR_FILE"
+
+# Create deployment bundle
+BUNDLE_DIR=$(mktemp -d)
+cp "$JAR_FILE" "$BUNDLE_DIR/application.jar"
+
+# Create Procfile for EB
+cat > "$BUNDLE_DIR/Procfile" << 'PROCFILE'
+web: java -jar application.jar
+PROCFILE
+
+# Zip the bundle
+(cd "$BUNDLE_DIR" && zip -r /tmp/deploy-bundle.zip .)
+
+# Upload to S3 and create EB application version
+S3_BUCKET="${AWS_EB_S3_BUCKET:-elasticbeanstalk-${REGION}-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo unknown)}"
+S3_KEY="$APP_NAME/$VERSION_LABEL.zip"
+
+aws s3 cp /tmp/deploy-bundle.zip "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
+
+aws elasticbeanstalk create-application-version \
+  --application-name "$APP_NAME" \
+  --version-label "$VERSION_LABEL" \
+  --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+  --region "$REGION"
+
+aws elasticbeanstalk update-environment \
+  --application-name "$APP_NAME" \
+  --environment-name "$ENV_NAME" \
+  --version-label "$VERSION_LABEL" \
+  --region "$REGION"
+
+echo "Deployed $VERSION_LABEL to $ENV_NAME"
+echo "Monitor: https://${REGION}.console.aws.amazon.com/elasticbeanstalk/home?region=${REGION}#/environment/dashboard?environmentId=${ENV_NAME}"`},
 				},
 			},
 		},
@@ -689,11 +792,12 @@ type stageTemplate struct {
 }
 
 type jobTemplate struct {
-	Name       string
-	Image      string   // per-job image override (empty = use pipeline default)
-	CacheKey   string   // per-job cache key override
-	CachePaths []string // per-job cache paths override
-	Steps      []stepTemplate
+	Name         string
+	Image        string   // per-job image override (empty = use pipeline default)
+	CacheKey     string   // per-job cache key override
+	CachePaths   []string // per-job cache paths override
+	Privileged   bool     // mount Docker socket + privileged mode
+	Steps        []stepTemplate
 }
 
 type stepTemplate struct {
@@ -765,6 +869,11 @@ func renderYAML(t pipelineTemplate) string {
 				jobImage = job.Image
 			}
 			b.WriteString(fmt.Sprintf("    image: %s\n", jobImage))
+
+			// Privileged mode — mount Docker socket for docker build etc.
+			if job.Privileged {
+				b.WriteString("    privileged: true\n")
+			}
 
 			// Per-job cache override, otherwise use pipeline default.
 			cacheKey := t.CacheKey
