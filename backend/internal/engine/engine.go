@@ -16,6 +16,7 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/engine/queue"
 	"github.com/oarkflow/deploy/backend/internal/engine/scheduler"
 	"github.com/oarkflow/deploy/backend/internal/models"
+	"github.com/oarkflow/deploy/backend/internal/pipeline"
 	"github.com/oarkflow/deploy/backend/internal/websocket"
 )
 
@@ -176,18 +177,145 @@ func (e *Engine) TriggerPipeline(ctx context.Context, pipelineID, triggerType st
 }
 
 // buildPipelineConfig converts the pipeline's stored config into a scheduler.PipelineConfig.
-// If the pipeline has YAML/JSON content, it attempts to parse it. Otherwise it returns
-// a minimal default config.
-func (e *Engine) buildPipelineConfig(pipeline *models.Pipeline) scheduler.PipelineConfig {
-	// Try to parse stored config_content as a PipelineConfig
-	if pipeline.ConfigContent != nil && *pipeline.ConfigContent != "" {
-		var config scheduler.PipelineConfig
-		if err := json.Unmarshal([]byte(*pipeline.ConfigContent), &config); err == nil && len(config.Stages) > 0 {
-			return config
+// It supports both the FlowForge YAML DSL and direct JSON scheduler config.
+func (e *Engine) buildPipelineConfig(p *models.Pipeline) scheduler.PipelineConfig {
+	if p.ConfigContent == nil || *p.ConfigContent == "" {
+		return defaultPipelineConfig()
+	}
+
+	content := *p.ConfigContent
+
+	// 1. Try direct JSON unmarshal into scheduler.PipelineConfig (for configs stored as scheduler JSON)
+	var direct scheduler.PipelineConfig
+	if err := json.Unmarshal([]byte(content), &direct); err == nil && len(direct.Stages) > 0 {
+		return direct
+	}
+
+	// 2. Parse as FlowForge YAML/JSON DSL using the pipeline parser
+	spec, err := pipeline.Parse(content)
+	if err != nil {
+		log.Warn().Err(err).Str("pipeline_id", p.ID).Msg("engine: failed to parse pipeline config, using default")
+		return defaultPipelineConfig()
+	}
+
+	return specToSchedulerConfig(spec)
+}
+
+// specToSchedulerConfig converts a parsed PipelineSpec into a scheduler.PipelineConfig
+// by grouping jobs by stage and mapping step fields.
+func specToSchedulerConfig(spec *pipeline.PipelineSpec) scheduler.PipelineConfig {
+	if spec == nil || len(spec.Jobs) == 0 {
+		return defaultPipelineConfig()
+	}
+
+	// Determine stage ordering: use explicit stages list if provided,
+	// otherwise collect stages from jobs in insertion order (map iteration order is random,
+	// so fall back to alphabetical).
+	stageOrder := spec.Stages
+	if len(stageOrder) == 0 {
+		seen := make(map[string]bool)
+		for _, job := range spec.Jobs {
+			stageName := job.Stage
+			if stageName == "" {
+				stageName = "default"
+			}
+			if !seen[stageName] {
+				stageOrder = append(stageOrder, stageName)
+				seen[stageName] = true
+			}
 		}
 	}
 
-	// Return a default minimal config
+	// Group jobs by stage name
+	stageJobs := make(map[string][]scheduler.JobConfig)
+	for jobName, jobSpec := range spec.Jobs {
+		stageName := jobSpec.Stage
+		if stageName == "" {
+			stageName = "default"
+		}
+
+		// Convert steps
+		var steps []scheduler.StepConfig
+		for i, stepSpec := range jobSpec.Steps {
+			cmd := stepSpec.Run
+			if cmd == "" && stepSpec.Uses != "" {
+				// Built-in actions aren't directly executable — emit a placeholder
+				cmd = fmt.Sprintf("echo '[flowforge] action: %s (not yet implemented)'", stepSpec.Uses)
+			}
+			if cmd == "" {
+				continue // Skip steps with no command
+			}
+
+			name := stepSpec.Name
+			if name == "" {
+				name = fmt.Sprintf("step-%d", i+1)
+			}
+
+			// Merge job-level env into step env
+			env := make(map[string]string)
+			for k, v := range spec.Env {
+				env[k] = v
+			}
+			for k, v := range jobSpec.Env {
+				env[k] = v
+			}
+			for k, v := range stepSpec.Env {
+				env[k] = v
+			}
+
+			steps = append(steps, scheduler.StepConfig{
+				Name:    name,
+				Command: cmd,
+				Env:     env,
+				Timeout: jobSpec.Timeout,
+			})
+		}
+
+		if len(steps) == 0 {
+			continue // Skip jobs with no executable steps
+		}
+
+		// Determine executor type — fall back to "local" since docker/k8s
+		// may not be available on the embedded worker
+		executorType := jobSpec.Executor
+		if executorType == "" && spec.Defaults != nil {
+			executorType = spec.Defaults.Executor
+		}
+		if executorType == "" {
+			executorType = "local"
+		}
+
+		jc := scheduler.JobConfig{
+			Name:         jobName,
+			ExecutorType: executorType,
+			Steps:        steps,
+		}
+
+		stageJobs[stageName] = append(stageJobs[stageName], jc)
+	}
+
+	// Build ordered stage configs
+	var stages []scheduler.StageConfig
+	for _, stageName := range stageOrder {
+		jobs, ok := stageJobs[stageName]
+		if !ok || len(jobs) == 0 {
+			continue
+		}
+		stages = append(stages, scheduler.StageConfig{
+			Name: stageName,
+			Jobs: jobs,
+		})
+	}
+
+	if len(stages) == 0 {
+		return defaultPipelineConfig()
+	}
+
+	return scheduler.PipelineConfig{Stages: stages}
+}
+
+// defaultPipelineConfig returns a minimal pipeline config that just echoes a message.
+func defaultPipelineConfig() scheduler.PipelineConfig {
 	return scheduler.PipelineConfig{
 		Stages: []scheduler.StageConfig{
 			{
@@ -233,4 +361,46 @@ func determinePriority(triggerType string) int {
 // Queue returns the engine's priority queue (for external inspection or testing).
 func (e *Engine) Queue() *queue.PriorityQueue {
 	return e.queue
+}
+
+// ReenqueueRun re-enqueues a pipeline run that is stuck in "queued" status in the DB.
+// This is used by the stale run recovery worker to pick up orphaned runs after a restart.
+func (e *Engine) ReenqueueRun(ctx context.Context, runID string) error {
+	run, err := e.repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("run not found: %w", err)
+	}
+
+	if run.Status != "queued" {
+		return nil // Already running or finished
+	}
+
+	pipeline, err := e.repos.Pipelines.GetByID(ctx, run.PipelineID)
+	if err != nil {
+		return fmt.Errorf("pipeline not found: %w", err)
+	}
+
+	pipelineConfig := e.buildPipelineConfig(pipeline)
+	configJSON, err := json.Marshal(pipelineConfig)
+	if err != nil {
+		return fmt.Errorf("failed to serialize config: %w", err)
+	}
+
+	job := &queue.Job{
+		ID:            uuid.New().String(),
+		PipelineRunID: run.ID,
+		Priority:      determinePriority(run.TriggerType),
+		CreatedAt:     time.Now(),
+		Config:        configJSON,
+	}
+
+	if err := e.queue.Enqueue(job); err != nil {
+		return fmt.Errorf("failed to enqueue: %w", err)
+	}
+
+	log.Info().
+		Str("run_id", runID).
+		Msg("engine: re-enqueued stale run")
+
+	return nil
 }

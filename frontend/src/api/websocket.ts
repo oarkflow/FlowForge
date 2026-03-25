@@ -46,8 +46,14 @@ export class FlowForgeWebSocket {
 
     this.ws.onmessage = (event) => {
       try {
-        const msg: WsMessage = JSON.parse(event.data);
-        this.emit(msg.type, msg.payload);
+        const data = JSON.parse(event.data);
+        // Backend sends flat JSON with a "type" field, not nested {type, payload}
+        if (data.type) {
+          const { type, ...rest } = data;
+          this.emit(type, rest);
+        } else {
+          this.emit('message', data);
+        }
       } catch {
         // Raw text messages (e.g., log lines)
         this.emit('message', event.data);

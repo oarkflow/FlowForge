@@ -105,7 +105,7 @@ make dev
 ```
 
 This starts:
-- **Backend** at `http://localhost:8080` (with hot reload via air)
+- **Backend** at `http://localhost:8081` (with hot reload via air)
 - **Frontend** at `http://localhost:3000` (with Vite HMR)
 - **MinIO** at `http://localhost:9001` (S3-compatible storage, login: minioadmin/minioadmin)
 
@@ -133,7 +133,7 @@ go run ./cmd/server
 # Terminal 2: Start the frontend
 cd frontend
 npm install
-VITE_API_URL=http://localhost:8080 npm run dev
+VITE_API_URL=http://localhost:8081 npm run dev
 ```
 
 Open `http://localhost:3000` in your browser.
@@ -182,7 +182,7 @@ npm run build
 
 ```bash
 # Check server health
-curl http://localhost:8080/api/v1/system/health
+curl http://localhost:8081/api/v1/system/health
 
 # Expected response:
 # {"status":"ok","timestamp":"..."}
@@ -211,7 +211,7 @@ FlowForge uses a layered configuration system with this precedence (highest to l
 
 | Variable | Description | Default |
 |---|---|---|
-| `FLOWFORGE_PORT` | HTTP server port | `8080` |
+| `FLOWFORGE_PORT` | HTTP server port | `8081` |
 | `FLOWFORGE_LOG_LEVEL` | Log level: debug, info, warn, error | `info` |
 | `FLOWFORGE_ALLOWED_ORIGINS` | CORS allowed origins | `*` |
 | `FLOWFORGE_MAX_UPLOAD_SIZE` | Max upload size in bytes | `52428800` (50 MB) |
@@ -311,7 +311,7 @@ You can also use a YAML config file:
 
 ```yaml
 # config.yaml
-port: "8080"
+port: "8081"
 database_path: "data/flowforge.db"
 jwt_secret: "your-secret-here"
 encryption_key: "your-64-char-hex-key"
@@ -331,7 +331,7 @@ Place it in the project root, `./config/`, or `/etc/flowforge/`.
 #### Register a New User
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/auth/register \
+curl -X POST http://localhost:8081/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "admin@example.com",
@@ -344,7 +344,7 @@ curl -X POST http://localhost:8080/api/v1/auth/register \
 #### Login
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/auth/login \
+curl -X POST http://localhost:8081/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "email": "admin@example.com",
@@ -369,7 +369,7 @@ export TOKEN="eyJhbGci..."
 
 ```bash
 # Create a project
-curl -X POST http://localhost:8080/api/v1/projects \
+curl -X POST http://localhost:8081/api/v1/projects \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -379,7 +379,7 @@ curl -X POST http://localhost:8080/api/v1/projects \
   }'
 
 # List projects
-curl http://localhost:8080/api/v1/projects \
+curl http://localhost:8081/api/v1/projects \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -387,7 +387,7 @@ curl http://localhost:8080/api/v1/projects \
 
 ```bash
 # Create a pipeline with inline YAML config
-curl -X POST http://localhost:8080/api/v1/projects/{project_id}/pipelines \
+curl -X POST http://localhost:8081/api/v1/projects/{project_id}/pipelines \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -397,7 +397,7 @@ curl -X POST http://localhost:8080/api/v1/projects/{project_id}/pipelines \
   }'
 
 # Trigger a pipeline run
-curl -X POST http://localhost:8080/api/v1/projects/{project_id}/pipelines/{pipeline_id}/trigger \
+curl -X POST http://localhost:8081/api/v1/projects/{project_id}/pipelines/{pipeline_id}/trigger \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -411,7 +411,7 @@ curl -X POST http://localhost:8080/api/v1/projects/{project_id}/pipelines/{pipel
 #### WebSocket
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws/runs/{run_id}/logs');
+const ws = new WebSocket('ws://localhost:8081/ws/runs/{run_id}/logs');
 
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
@@ -437,7 +437,7 @@ source.onmessage = (event) => {
 
 ```bash
 # Create a secret
-curl -X POST http://localhost:8080/api/v1/projects/{project_id}/secrets \
+curl -X POST http://localhost:8081/api/v1/projects/{project_id}/secrets \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -446,7 +446,7 @@ curl -X POST http://localhost:8080/api/v1/projects/{project_id}/secrets \
   }'
 
 # List secrets (values are never returned)
-curl http://localhost:8080/api/v1/projects/{project_id}/secrets \
+curl http://localhost:8081/api/v1/projects/{project_id}/secrets \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -454,7 +454,7 @@ curl http://localhost:8080/api/v1/projects/{project_id}/secrets \
 
 ```bash
 # Register an agent
-curl -X POST http://localhost:8080/api/v1/agents \
+curl -X POST http://localhost:8081/api/v1/agents \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -464,11 +464,11 @@ curl -X POST http://localhost:8080/api/v1/agents \
   }'
 
 # List agents with status
-curl http://localhost:8080/api/v1/agents \
+curl http://localhost:8081/api/v1/agents \
   -H "Authorization: Bearer $TOKEN"
 
 # Drain an agent (stop accepting new jobs)
-curl -X POST http://localhost:8080/api/v1/agents/{agent_id}/drain \
+curl -X POST http://localhost:8081/api/v1/agents/{agent_id}/drain \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -476,7 +476,7 @@ curl -X POST http://localhost:8080/api/v1/agents/{agent_id}/drain \
 
 ```bash
 # Add a Slack notification channel to a project
-curl -X POST http://localhost:8080/api/v1/projects/{project_id}/notifications \
+curl -X POST http://localhost:8081/api/v1/projects/{project_id}/notifications \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

@@ -14,12 +14,12 @@ services:
     container_name: flowforge-backend
     restart: unless-stopped
     ports:
-      - "${BACKEND_PORT:-8080}:8080"
+      - "${BACKEND_PORT:-8081}:8081"
     volumes:
       - flowforge-data:/data
     environment:
       - DATABASE_PATH=${DATABASE_PATH:-/data/flowforge.db}
-      - PORT=${BACKEND_PORT:-8080}
+      - PORT=${BACKEND_PORT:-8081}
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
@@ -31,7 +31,8 @@ services:
       - S3_ACCESS_KEY=${S3_ACCESS_KEY:-}
       - S3_SECRET_KEY=${S3_SECRET_KEY:-}
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/v1/system/health"]
+      test:
+        ["CMD", "wget", "-qO-", "http://localhost:8081/api/v1/system/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -71,7 +72,7 @@ services:
   #     - /var/run/docker.sock:/var/run/docker.sock
   #     - agent-workspaces:/data/workspaces
   #   environment:
-  #     - SERVER_URL=http://backend:8080
+  #     - SERVER_URL=http://backend:8081
   #     - AGENT_NAME=local-agent-1
   #     - AGENT_TOKEN=${AGENT_TOKEN:-}
   #     - EXECUTOR_TYPE=docker

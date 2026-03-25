@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package agentpb;
+
+option go_package = "github.com/oarkflow/deploy/backend/proto/agentpb";
+
+// AgentService defines the gRPC interface between FlowForge server and agents.
+service AgentService {
+    // Register registers an agent with the server.
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+
+    // Heartbeat maintains a bidirectional stream for agent health monitoring.
+    rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+    // ExecuteJob dispatches a job to the agent and streams events back.
+    rpc ExecuteJob(ExecuteJobRequest) returns (stream JobEvent);
+
+    // ReportStatus reports the final status of a job execution.
+    rpc ReportStatus(ReportStatusRequest) returns (ReportStatusResponse);
+}
+
+// RegisterRequest is sent by agents to register with the server.
+message RegisterRequest {
+    string token = 1;           // Agent authentication token
+    string name = 2;            // Human-readable agent name
+    repeated string labels = 3; // Agent capability labels
+    string executor = 4;        // Executor type: local, docker, kubernetes
+    string os = 5;              // Operating system
+    string arch = 6;            // Architecture (amd64, arm64, etc.)
+    int32 cpu_cores = 7;        // Available CPU cores
+    int64 memory_mb = 8;        // Available memory in MB
+    string version = 9;         // Agent software version
+}
+
+// RegisterResponse confirms agent registration.
+message RegisterResponse {
+    string agent_id = 1;        // Assigned agent ID
+    bool accepted = 2;          // Whether registration was accepted
+    string message = 3;         // Human-readable message
+    int32 heartbeat_interval_seconds = 4; // Recommended heartbeat interval
+}
+
+// HeartbeatRequest is sent periodically by the agent.
+message HeartbeatRequest {
+    string agent_id = 1;
+    int32 active_jobs = 2;      // Number of currently running jobs
+    double cpu_usage = 3;       // CPU usage percentage (0-100)
+    double memory_usage = 4;    // Memory usage percentage (0-100)
+    int64 timestamp_ms = 5;     // Unix timestamp in milliseconds
+}
+
+// HeartbeatResponse is sent by the server in response to heartbeats.
+message HeartbeatResponse {
+    string command = 1;         // Optional command: "drain", "shutdown", ""
+    string message = 2;         // Optional message
+}
+
+// ExecuteJobRequest contains all information needed to execute a job.
+message ExecuteJobRequest {
+    string job_run_id = 1;             // Unique job run identifier
+    string pipeline_run_id = 2;        // Parent pipeline run ID
+    string config_json = 3;            // Job configuration as JSON
+    map<string, string> env_vars = 4;  // Environment variables
+    repeated string secrets = 5;       // Encrypted secret values
+    repeated ArtifactRef artifacts = 6; // Artifacts from upstream steps
+    string clone_url = 7;              // Repository clone URL
+    string commit_sha = 8;             // Commit to checkout
+    string branch = 9;                 // Branch name
+    string executor_type = 10;         // Executor to use
+    string image = 11;                 // Docker/K8s image
+    repeated StepConfig steps = 12;    // Steps to execute
+}
+
+// StepConfig defines a single step within a job.
+message StepConfig {
+    string step_run_id = 1;
+    string name = 2;
+    string command = 3;
+    string working_dir = 4;
+    map<string, string> env = 5;
+    int64 timeout_seconds = 6;
+    bool continue_on_error = 7;
+    int32 retry_count = 8;
+}
+
+// ArtifactRef references an artifact from a previous step/job.
+message ArtifactRef {
+    string artifact_id = 1;
+    string name = 2;
+    string download_url = 3;
+    string path = 4;
+}
+
+// JobEvent is streamed from agent to server during job execution.
+message JobEvent {
+    oneof event {
+        LogLine log = 1;
+        StepStatus step_status = 2;
+        JobComplete complete = 3;
+        ArtifactUploaded artifact = 4;
+    }
+}
+
+// LogLine represents a single line of output from a step.
+message LogLine {
+    string step_run_id = 1;
+    string stream = 2;         // stdout, stderr, or system
+    string content = 3;
+    int64 timestamp_ms = 4;
+}
+
+// StepStatus reports the status change of a step.
+message StepStatus {
+    string step_run_id = 1;
+    string status = 2;         // running, success, failure, skipped
+    int32 exit_code = 3;
+    string error_message = 4;
+    int64 started_at_ms = 5;
+    int64 finished_at_ms = 6;
+    int64 duration_ms = 7;
+}
+
+// JobComplete reports the final status of a job.
+message JobComplete {
+    string job_run_id = 1;
+    string status = 2;         // success, failure, cancelled
+    int64 duration_ms = 3;
+    string error_message = 4;
+}
+
+// ArtifactUploaded reports that an artifact has been uploaded.
+message ArtifactUploaded {
+    string step_run_id = 1;
+    string name = 2;
+    string path = 3;
+    int64 size_bytes = 4;
+    string checksum_sha256 = 5;
+}
+
+// ReportStatusRequest is the final status report for a job.
+message ReportStatusRequest {
+    string agent_id = 1;
+    string job_run_id = 2;
+    string status = 3;         // success, failure, cancelled
+    int64 duration_ms = 4;
+    string error_message = 5;
+    repeated StepResult step_results = 6;
+}
+
+// StepResult contains the result of a single step execution.
+message StepResult {
+    string step_run_id = 1;
+    string status = 2;
+    int32 exit_code = 3;
+    int64 duration_ms = 4;
+    string error_message = 5;
+}
+
+// ReportStatusResponse acknowledges the status report.
+message ReportStatusResponse {
+    bool acknowledged = 1;
+    string message = 2;
+}

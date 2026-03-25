@@ -16,6 +16,7 @@ import (
 	fiberlogger "github.com/gofiber/fiber/v3/middleware/logger"
 	"github.com/gofiber/fiber/v3/middleware/recover"
 
+	agentpkg "github.com/oarkflow/deploy/backend/internal/agent"
 	"github.com/oarkflow/deploy/backend/internal/api"
 	"github.com/oarkflow/deploy/backend/internal/api/middleware"
 	"github.com/oarkflow/deploy/backend/internal/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/notifications"
 	"github.com/oarkflow/deploy/backend/internal/storage"
 	ws "github.com/oarkflow/deploy/backend/internal/websocket"
+	"github.com/oarkflow/deploy/backend/internal/worker"
 	pkglogger "github.com/oarkflow/deploy/backend/pkg/logger"
 )
 
@@ -82,6 +84,30 @@ func main() {
 	// Import Service
 	importSvc := importer.New(encKey)
 
+	// Agent System (pool, dispatcher, heartbeat monitor, server)
+	agentPool := agentpkg.NewPool()
+	agentDispatcher := agentpkg.NewDispatcher(agentPool, 256)
+	agentServer := agentpkg.NewServer(agentPool, agentDispatcher, database)
+
+	heartbeatMonitor := agentpkg.NewHeartbeatMonitor(agentPool, 60*time.Second, 10*time.Second)
+	heartbeatMonitor.OnEvict(func(agentID string) {
+		appLog.Warn().Str("agent_id", agentID).Msg("agent evicted due to heartbeat timeout")
+		// Update DB status
+		database.Exec("UPDATE agents SET status = 'offline' WHERE id = ?", agentID)
+	})
+	heartbeatCtx, heartbeatCancel := context.WithCancel(context.Background())
+	go heartbeatMonitor.Start(heartbeatCtx)
+
+	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
+	go agentDispatcher.Start(dispatchCtx)
+
+	// Background Worker Pool
+	workerPool := worker.NewPool(database)
+	workerPool.SetEngine(eng)
+	workerPool.RegisterDefaults()
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	go workerPool.Start(workerCtx)
+
 	// Fiber app
 	app := fiber.New(fiber.Config{
 		AppName:      "FlowForge v1.0",
@@ -99,7 +125,7 @@ func main() {
 	app.Use(middleware.RateLimiter(100, time.Minute))
 
 	// Register REST API routes
-	api.RegisterRoutes(app, database, cfg, importSvc)
+	api.RegisterRoutes(app, database, cfg, importSvc, agentServer, eng)
 
 	// WebSocket routes
 	app.Get("/ws/runs/:runId/logs", wsHandler.HandleRunLogs)
@@ -121,6 +147,7 @@ func main() {
 	appLog.Info().
 		Str("port", cfg.Port).
 		Str("db", cfg.DatabasePath).
+		Bool("embedded_worker", cfg.EmbeddedWorker).
 		Msg("FlowForge server is running")
 
 	<-ctx.Done()
@@ -134,6 +161,9 @@ func main() {
 	// Stop services
 	eng.Stop()
 	notifCancel()
+	heartbeatCancel()
+	dispatchCancel()
+	workerCancel()
 
 	if err := app.Shutdown(); err != nil {
 		appLog.Error().Err(err).Msg("shutdown error")

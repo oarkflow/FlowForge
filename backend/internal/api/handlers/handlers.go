@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,6 +24,12 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/secrets"
 )
 
+// PipelineEngine is the interface the handler uses to trigger pipeline runs.
+// This avoids a direct dependency on the engine package.
+type PipelineEngine interface {
+	TriggerPipeline(ctx context.Context, pipelineID, triggerType string, triggerData map[string]string) (*models.PipelineRun, error)
+}
+
 type Handler struct {
 	db          *sqlx.DB
 	cfg         *config.Config
@@ -30,9 +37,10 @@ type Handler struct {
 	secretStore *secrets.SecretStore
 	audit       *auth.AuditLogger
 	importer    *importer.Service
+	engine      PipelineEngine
 }
 
-func New(db *sqlx.DB, cfg *config.Config, imp *importer.Service) *Handler {
+func New(db *sqlx.DB, cfg *config.Config, imp *importer.Service, engine PipelineEngine) *Handler {
 	repos := queries.NewRepositories(db)
 	encKey, _ := hex.DecodeString(cfg.EncryptionKey)
 	return &Handler{
@@ -42,6 +50,7 @@ func New(db *sqlx.DB, cfg *config.Config, imp *importer.Service) *Handler {
 		secretStore: secrets.NewSecretStore(repos, encKey),
 		audit:       auth.NewAuditLogger(repos.AuditLogs),
 		importer:    imp,
+		engine:      engine,
 	}
 }
 
@@ -988,43 +997,24 @@ func (h *Handler) TriggerPipeline(c fiber.Ctx) error {
 	// Input is optional for manual triggers
 	_ = c.Bind().JSON(&input)
 
-	p, err := h.repo.Pipelines.GetByID(c.Context(), pipelineID)
-	if err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "pipeline not found")
+	// Build trigger data map for the engine
+	triggerData := make(map[string]string)
+	if input.Branch != nil {
+		triggerData["branch"] = *input.Branch
 	}
-	if p.IsActive == 0 {
-		return fiber.NewError(fiber.StatusBadRequest, "pipeline is not active")
+	if input.Tag != nil {
+		triggerData["tag"] = *input.Tag
 	}
-
-	// Get the next run number
-	nextNum, err := h.repo.Runs.GetNextNumber(c.Context(), pipelineID)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to get next run number")
+	for k, v := range input.Inputs {
+		triggerData[k] = v
 	}
 
 	userID := getUserID(c)
+	triggerData["created_by"] = userID
 
-	// Build trigger data JSON
-	triggerData := fiber.Map{}
-	if input.Inputs != nil {
-		triggerData["inputs"] = input.Inputs
-	}
-	triggerDataJSON, _ := json.Marshal(triggerData)
-	triggerDataStr := string(triggerDataJSON)
-
-	run := &models.PipelineRun{
-		PipelineID:  pipelineID,
-		Number:      nextNum,
-		Status:      "queued",
-		TriggerType: "manual",
-		TriggerData: &triggerDataStr,
-		Branch:      input.Branch,
-		Tag:         input.Tag,
-		CreatedBy:   &userID,
-	}
-
-	if err := h.repo.Runs.Create(c.Context(), run); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to create pipeline run: "+err.Error())
+	run, err := h.engine.TriggerPipeline(c.Context(), pipelineID, "manual", triggerData)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to trigger pipeline: "+err.Error())
 	}
 
 	_ = h.audit.LogAction(c.Context(), userID, getClientIP(c), "trigger", "pipeline", pipelineID,
@@ -1107,16 +1097,23 @@ func (h *Handler) GetRun(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "run not found")
 	}
 
-	// Enrich with stages if available
+	// Enrich with full stage→job→step hierarchy
 	stages, _ := h.repo.Runs.ListStageRuns(c.Context(), run.ID)
+	jobs, _ := h.repo.Runs.ListJobRunsByRunID(c.Context(), run.ID)
+	steps, _ := h.repo.Runs.ListStepRunsByRunID(c.Context(), run.ID)
+
 	type enrichedRun struct {
 		*models.PipelineRun
 		Stages []models.StageRun `json:"stages,omitempty"`
+		Jobs   []models.JobRun   `json:"jobs,omitempty"`
+		Steps  []models.StepRun  `json:"steps,omitempty"`
 	}
 
 	return c.JSON(enrichedRun{
 		PipelineRun: run,
 		Stages:      stages,
+		Jobs:        jobs,
+		Steps:       steps,
 	})
 }
 
@@ -1149,29 +1146,32 @@ func (h *Handler) RerunPipeline(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "run not found")
 	}
 
-	nextNum, err := h.repo.Runs.GetNextNumber(c.Context(), origRun.PipelineID)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to get next run number")
-	}
-
 	userID := getUserID(c)
-	rerunData := fmt.Sprintf(`{"rerun_of":"%s"}`, runID)
-	newRun := &models.PipelineRun{
-		PipelineID:    origRun.PipelineID,
-		Number:        nextNum,
-		Status:        "queued",
-		TriggerType:   origRun.TriggerType,
-		TriggerData:   &rerunData,
-		CommitSHA:     origRun.CommitSHA,
-		CommitMessage: origRun.CommitMessage,
-		Branch:        origRun.Branch,
-		Tag:           origRun.Tag,
-		Author:        origRun.Author,
-		CreatedBy:     &userID,
+
+	// Build trigger data from the original run
+	triggerData := map[string]string{
+		"rerun_of":   runID,
+		"created_by": userID,
+	}
+	if origRun.Branch != nil {
+		triggerData["branch"] = *origRun.Branch
+	}
+	if origRun.CommitSHA != nil {
+		triggerData["commit_sha"] = *origRun.CommitSHA
+	}
+	if origRun.CommitMessage != nil {
+		triggerData["commit_message"] = *origRun.CommitMessage
+	}
+	if origRun.Author != nil {
+		triggerData["author"] = *origRun.Author
+	}
+	if origRun.Tag != nil {
+		triggerData["tag"] = *origRun.Tag
 	}
 
-	if err := h.repo.Runs.Create(c.Context(), newRun); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to create rerun")
+	newRun, err := h.engine.TriggerPipeline(c.Context(), origRun.PipelineID, origRun.TriggerType, triggerData)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to rerun pipeline: "+err.Error())
 	}
 
 	_ = h.audit.LogAction(c.Context(), userID, getClientIP(c), "rerun", "pipeline_run", runID,
@@ -1192,13 +1192,32 @@ func (h *Handler) ApproveRun(c fiber.Ctx) error {
 			fmt.Sprintf("run is not waiting for approval (current status: %s)", run.Status))
 	}
 
-	if err := h.repo.Runs.UpdateStatus(c.Context(), runID, "queued"); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to approve run")
+	// Re-trigger through the engine so the run gets enqueued
+	triggerData := make(map[string]string)
+	if run.Branch != nil {
+		triggerData["branch"] = *run.Branch
 	}
+	if run.CommitSHA != nil {
+		triggerData["commit_sha"] = *run.CommitSHA
+	}
+	if run.CommitMessage != nil {
+		triggerData["commit_message"] = *run.CommitMessage
+	}
+	if run.Author != nil {
+		triggerData["author"] = *run.Author
+	}
+
+	newRun, err := h.engine.TriggerPipeline(c.Context(), run.PipelineID, run.TriggerType, triggerData)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to approve run: "+err.Error())
+	}
+
+	// Mark the original waiting run as cancelled since we created a new one
+	_ = h.repo.Runs.UpdateStatus(c.Context(), runID, "cancelled")
 
 	_ = h.audit.LogAction(c.Context(), getUserID(c), getClientIP(c), "approve", "pipeline_run", runID, nil)
 
-	return c.JSON(fiber.Map{"message": "run approved", "run_id": runID})
+	return c.JSON(fiber.Map{"message": "run approved", "run_id": newRun.ID, "run_number": newRun.Number})
 }
 
 func (h *Handler) GetRunLogs(c fiber.Ctx) error {
@@ -1802,31 +1821,26 @@ func (h *Handler) GithubWebhook(c fiber.Ctx) error {
 			continue
 		}
 
-		nextNum, err := h.repo.Runs.GetNextNumber(c.Context(), p.ID)
-		if err != nil {
-			continue
-		}
-
-		triggerDataJSON, _ := json.Marshal(fiber.Map{
+		triggerData := map[string]string{
 			"event":      eventType,
 			"repository": repoFullName,
 			"sender":     author,
-		})
-		triggerDataStr := string(triggerDataJSON)
-
-		run := &models.PipelineRun{
-			PipelineID:    p.ID,
-			Number:        nextNum,
-			Status:        "queued",
-			TriggerType:   triggerType,
-			TriggerData:   &triggerDataStr,
-			CommitSHA:     strPtrOrNil(commitSHA),
-			CommitMessage: strPtrOrNil(commitMsg),
-			Branch:        strPtrOrNil(branch),
-			Author:        strPtrOrNil(author),
+		}
+		if branch != "" {
+			triggerData["branch"] = branch
+		}
+		if commitSHA != "" {
+			triggerData["commit_sha"] = commitSHA
+		}
+		if commitMsg != "" {
+			triggerData["commit_message"] = commitMsg
+		}
+		if author != "" {
+			triggerData["author"] = author
 		}
 
-		if err := h.repo.Runs.Create(c.Context(), run); err != nil {
+		run, err := h.engine.TriggerPipeline(c.Context(), p.ID, triggerType, triggerData)
+		if err != nil {
 			continue
 		}
 
@@ -1925,29 +1939,25 @@ func (h *Handler) GitlabWebhook(c fiber.Ctx) error {
 		if p.IsActive == 0 || p.RepositoryID == nil || *p.RepositoryID != matchedRepo.ID {
 			continue
 		}
-		nextNum, err := h.repo.Runs.GetNextNumber(c.Context(), p.ID)
-		if err != nil {
-			continue
-		}
 
-		triggerDataJSON, _ := json.Marshal(fiber.Map{
+		triggerData := map[string]string{
 			"event":      payload.ObjectKind,
 			"repository": payload.Project.PathWithNamespace,
-		})
-		triggerDataStr := string(triggerDataJSON)
-
-		run := &models.PipelineRun{
-			PipelineID:    p.ID,
-			Number:        nextNum,
-			Status:        "queued",
-			TriggerType:   triggerType,
-			TriggerData:   &triggerDataStr,
-			CommitSHA:     strPtrOrNil(commitSHA),
-			CommitMessage: strPtrOrNil(commitMsg),
-			Branch:        strPtrOrNil(branch),
-			Author:        strPtrOrNil(author),
 		}
-		if err := h.repo.Runs.Create(c.Context(), run); err == nil {
+		if branch != "" {
+			triggerData["branch"] = branch
+		}
+		if commitSHA != "" {
+			triggerData["commit_sha"] = commitSHA
+		}
+		if commitMsg != "" {
+			triggerData["commit_message"] = commitMsg
+		}
+		if author != "" {
+			triggerData["author"] = author
+		}
+
+		if _, err := h.engine.TriggerPipeline(c.Context(), p.ID, triggerType, triggerData); err == nil {
 			runsCreated++
 		}
 	}
@@ -2048,29 +2058,25 @@ func (h *Handler) BitbucketWebhook(c fiber.Ctx) error {
 		if p.IsActive == 0 || p.RepositoryID == nil || *p.RepositoryID != matchedRepo.ID {
 			continue
 		}
-		nextNum, err := h.repo.Runs.GetNextNumber(c.Context(), p.ID)
-		if err != nil {
-			continue
-		}
 
-		triggerDataJSON, _ := json.Marshal(fiber.Map{
+		triggerData := map[string]string{
 			"event":      eventType,
 			"repository": payload.Repository.FullName,
-		})
-		triggerDataStr := string(triggerDataJSON)
-
-		run := &models.PipelineRun{
-			PipelineID:    p.ID,
-			Number:        nextNum,
-			Status:        "queued",
-			TriggerType:   triggerType,
-			TriggerData:   &triggerDataStr,
-			CommitSHA:     strPtrOrNil(commitSHA),
-			CommitMessage: strPtrOrNil(commitMsg),
-			Branch:        strPtrOrNil(branch),
-			Author:        strPtrOrNil(author),
 		}
-		if err := h.repo.Runs.Create(c.Context(), run); err == nil {
+		if branch != "" {
+			triggerData["branch"] = branch
+		}
+		if commitSHA != "" {
+			triggerData["commit_sha"] = commitSHA
+		}
+		if commitMsg != "" {
+			triggerData["commit_message"] = commitMsg
+		}
+		if author != "" {
+			triggerData["author"] = author
+		}
+
+		if _, err := h.engine.TriggerPipeline(c.Context(), p.ID, triggerType, triggerData); err == nil {
 			runsCreated++
 		}
 	}

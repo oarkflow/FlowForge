@@ -78,7 +78,7 @@ type JobSpec struct {
 	Executor         string            `yaml:"executor,omitempty" json:"executor,omitempty"`
 	Image            string            `yaml:"image,omitempty" json:"image,omitempty"`
 	Env              map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
-	Cache            []CacheConfig     `yaml:"cache,omitempty" json:"cache,omitempty"`
+	Cache            CacheList         `yaml:"cache,omitempty" json:"cache,omitempty"`
 	Steps            []StepSpec        `yaml:"steps" json:"steps"`
 	Needs            []string          `yaml:"needs,omitempty" json:"needs,omitempty"`
 	Matrix           *MatrixConfig     `yaml:"matrix,omitempty" json:"matrix,omitempty"`
@@ -146,6 +146,52 @@ func (m MatrixConfig) MarshalJSON() ([]byte, error) {
 type CacheConfig struct {
 	Key   string   `yaml:"key" json:"key"`
 	Paths []string `yaml:"paths" json:"paths"`
+}
+
+// CacheList is a list of CacheConfig that accepts either a single object or
+// a list in YAML/JSON. This allows both:
+//
+//	cache:
+//	  key: foo
+//	  paths: [bar]
+//
+// and:
+//
+//	cache:
+//	  - key: foo
+//	    paths: [bar]
+type CacheList []CacheConfig
+
+// UnmarshalYAML accepts a single CacheConfig map or a list of CacheConfig.
+func (cl *CacheList) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Try as list first
+	var list []CacheConfig
+	if err := unmarshal(&list); err == nil {
+		*cl = list
+		return nil
+	}
+	// Fall back to single object
+	var single CacheConfig
+	if err := unmarshal(&single); err != nil {
+		return err
+	}
+	*cl = CacheList{single}
+	return nil
+}
+
+// UnmarshalJSON accepts a single CacheConfig object or a list of CacheConfig.
+func (cl *CacheList) UnmarshalJSON(data []byte) error {
+	var list []CacheConfig
+	if err := json.Unmarshal(data, &list); err == nil {
+		*cl = list
+		return nil
+	}
+	var single CacheConfig
+	if err := json.Unmarshal(data, &single); err != nil {
+		return err
+	}
+	*cl = CacheList{single}
+	return nil
 }
 
 // NotifyConfig defines notification rules for the pipeline.

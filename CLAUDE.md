@@ -1539,7 +1539,7 @@ services:
     build:
       context: ./backend
       dockerfile: ../deploy/docker/Dockerfile.backend
-    ports: ["8080:8080"]
+    ports: ["8081:8081"]
     volumes:
       - ./data:/data
       - ./backend:/app  # hot reload with air
@@ -1556,7 +1556,7 @@ services:
     volumes:
       - ./frontend/src:/app/src
     environment:
-      - VITE_API_URL=http://localhost:8080
+      - VITE_API_URL=http://localhost:8081
 
   minio:
     image: minio/minio
@@ -1586,7 +1586,7 @@ spec:
       containers:
         - name: server
           image: flowforge/server:latest
-          ports: [{containerPort: 8080}]
+          ports: [{containerPort: 8081}]
           env:
             - name: DATABASE_PATH
               value: /data/flowforge.db
@@ -1602,9 +1602,9 @@ spec:
             requests: {cpu: "100m", memory: "128Mi"}
             limits: {cpu: "500m", memory: "512Mi"}
           readinessProbe:
-            httpGet: {path: /api/v1/system/health, port: 8080}
+            httpGet: {path: /api/v1/system/health, port: 8081}
           livenessProbe:
-            httpGet: {path: /api/v1/system/health, port: 8080}
+            httpGet: {path: /api/v1/system/health, port: 8081}
       volumes:
         - name: data
           persistentVolumeClaim:

@@ -165,3 +165,27 @@ func (r *RunRepo) UpdateStepRun(ctx context.Context, s *models.StepRun) error {
 		s)
 	return err
 }
+
+// UpdateStepRunStatus updates just the status field of a step run.
+func (r *RunRepo) UpdateStepRunStatus(ctx context.Context, id, status string) error {
+	_, err := r.db.ExecContext(ctx, "UPDATE step_runs SET status = ? WHERE id = ?", status, id)
+	return err
+}
+
+// ListJobRunsByRunID returns all job runs for a given pipeline run.
+func (r *RunRepo) ListJobRunsByRunID(ctx context.Context, runID string) ([]models.JobRun, error) {
+	jobs := []models.JobRun{}
+	err := r.db.SelectContext(ctx, &jobs, "SELECT * FROM job_runs WHERE run_id = ? ORDER BY rowid ASC", runID)
+	return jobs, err
+}
+
+// ListStepRunsByRunID returns all step runs for a given pipeline run via job_runs.
+func (r *RunRepo) ListStepRunsByRunID(ctx context.Context, runID string) ([]models.StepRun, error) {
+	steps := []models.StepRun{}
+	err := r.db.SelectContext(ctx, &steps,
+		`SELECT s.* FROM step_runs s
+		 JOIN job_runs j ON j.id = s.job_run_id
+		 WHERE j.run_id = ?
+		 ORDER BY s.rowid ASC`, runID)
+	return steps, err
+}

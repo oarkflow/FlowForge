@@ -1,17 +1,21 @@
 package api
 
 import (
+	"bytes"
+	"net/http"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/jmoiron/sqlx"
 
+	agentpkg "github.com/oarkflow/deploy/backend/internal/agent"
 	"github.com/oarkflow/deploy/backend/internal/api/handlers"
 	"github.com/oarkflow/deploy/backend/internal/api/middleware"
 	"github.com/oarkflow/deploy/backend/internal/config"
 	"github.com/oarkflow/deploy/backend/internal/importer"
 )
 
-func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *importer.Service) {
-	h := handlers.New(db, cfg, imp)
+func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *importer.Service, agentServer *agentpkg.Server, engine handlers.PipelineEngine) {
+	h := handlers.New(db, cfg, imp, engine)
 
 	api := app.Group("/api/v1")
 
@@ -128,4 +132,62 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	webhooks.Post("/github", h.GithubWebhook)
 	webhooks.Post("/gitlab", h.GitlabWebhook)
 	webhooks.Post("/bitbucket", h.BitbucketWebhook)
+
+	// Agent communication endpoints (unauthenticated — token validated by agent server)
+	agentComm := api.Group("/agents")
+	if agentServer != nil {
+		agentComm.Post("/register", wrapHTTPHandler(agentServer.HandleRegister))
+		agentComm.Post("/heartbeat", wrapHTTPHandler(agentServer.HandleHeartbeat))
+		agentComm.Post("/poll", wrapHTTPHandler(agentServer.HandleJobPoll))
+		agentComm.Post("/complete", wrapHTTPHandler(agentServer.HandleJobComplete))
+		agentComm.Post("/log", wrapHTTPHandler(agentServer.HandleLog))
+	}
+}
+
+// wrapHTTPHandler adapts a net/http handler function to a Fiber handler.
+func wrapHTTPHandler(handler func(w http.ResponseWriter, r *http.Request)) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		// Use Fiber's built-in adaptor: read body, build http.Request, capture response
+		c.Set("Content-Type", "application/json")
+
+		// Create a response writer adapter
+		w := &fiberResponseWriter{ctx: c, statusCode: 200}
+		r, err := http.NewRequest(c.Method(), c.OriginalURL(), bytes.NewReader(c.Body()))
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "failed to create request"})
+		}
+		r.Header.Set("Content-Type", "application/json")
+
+		handler(w, r)
+
+		if w.written {
+			return nil
+		}
+		return c.Status(w.statusCode).Send(w.body)
+	}
+}
+
+// fiberResponseWriter adapts Fiber's context to net/http.ResponseWriter.
+type fiberResponseWriter struct {
+	ctx        fiber.Ctx
+	statusCode int
+	headers    http.Header
+	body       []byte
+	written    bool
+}
+
+func (w *fiberResponseWriter) Header() http.Header {
+	if w.headers == nil {
+		w.headers = make(http.Header)
+	}
+	return w.headers
+}
+
+func (w *fiberResponseWriter) Write(b []byte) (int, error) {
+	w.body = append(w.body, b...)
+	return len(b), nil
+}
+
+func (w *fiberResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
 }
