@@ -139,6 +139,7 @@ export interface PipelineRun {
 	finished_at?: string;
 	duration_ms?: number;
 	error_summary?: string;
+	deploy_url?: string;
 	created_by?: string;
 	created_at: string;
 }

@@ -113,6 +113,7 @@ func generateGoPipeline(r DetectionResult) string {
 					},
 				},
 			},
+			deployStage("my-go-app"),
 		},
 	})
 }
@@ -213,6 +214,7 @@ func generateNodePipeline(r DetectionResult) string {
 					},
 				},
 			},
+			deployStage("my-node-app"),
 		},
 	})
 }
@@ -366,6 +368,7 @@ func generateJavaPipeline(r DetectionResult) string {
 					},
 				},
 			},
+			deployStage("my-java-app"),
 		},
 	})
 }
@@ -674,7 +677,46 @@ func generateScalaPipeline(results []DetectionResult, r DetectionResult) string 
 	// Uses docker:26-cli with privileged mode (host Docker socket) to
 	// stop any previous instance and start a fresh container.
 	// Configure APP_PORT (default 8080) and APP_NAME via project env vars.
-	stages = append(stages, stageTemplate{
+	stages = append(stages, deployStage("my-scala-app"))
+
+	return renderYAML(pipelineTemplate{
+		Name:    "Scala CI/CD",
+		Comment: framework,
+		Image:   jdkImage,
+		Stages:  stages,
+	})
+}
+
+func generateGenericPipeline() string {
+	return renderYAML(pipelineTemplate{
+		Name:  "CI Pipeline",
+		Image: "ubuntu:22.04",
+		Stages: []stageTemplate{
+			{
+				Name: "build",
+				Jobs: []jobTemplate{
+					{
+						Name: "build",
+						Steps: []stepTemplate{
+							{Name: "Show environment", Run: "uname -a && pwd && ls -la"},
+							{Name: "Echo", Run: "echo 'Configure your pipeline in flowforge.yml'"},
+						},
+					},
+				},
+			},
+		},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Shared deploy stage — deploys to local Docker
+// ---------------------------------------------------------------------------
+
+// deployStage returns a reusable deploy stage that stops any existing container
+// and runs the freshly built image on the host Docker daemon.
+// appName is the default container name (e.g. "my-go-app").
+func deployStage(appName string) stageTemplate {
+	return stageTemplate{
 		Name: "deploy",
 		Jobs: []jobTemplate{
 			{
@@ -682,7 +724,7 @@ func generateScalaPipeline(results []DetectionResult, r DetectionResult) string 
 				Image:      "docker:26-cli",
 				Privileged: true,
 				Steps: []stepTemplate{
-					{Name: "Deploy to Docker", Run: `APP_NAME="${APP_NAME:-my-scala-app}"
+					{Name: "Deploy to Docker", Run: fmt.Sprintf(`APP_NAME="${APP_NAME:-%s}"
 APP_PORT="${APP_PORT:-8080}"
 HOST_PORT="${HOST_PORT:-8080}"
 
@@ -714,39 +756,11 @@ else
   echo "Error: Container failed to start"
   docker logs "$APP_NAME" 2>&1 | tail -20
   exit 1
-fi`},
+fi`, appName)},
 				},
 			},
 		},
-	})
-
-	return renderYAML(pipelineTemplate{
-		Name:    "Scala CI/CD",
-		Comment: framework,
-		Image:   jdkImage,
-		Stages:  stages,
-	})
-}
-
-func generateGenericPipeline() string {
-	return renderYAML(pipelineTemplate{
-		Name:  "CI Pipeline",
-		Image: "ubuntu:22.04",
-		Stages: []stageTemplate{
-			{
-				Name: "build",
-				Jobs: []jobTemplate{
-					{
-						Name: "build",
-						Steps: []stepTemplate{
-							{Name: "Show environment", Run: "uname -a && pwd && ls -la"},
-							{Name: "Echo", Run: "echo 'Configure your pipeline in flowforge.yml'"},
-						},
-					},
-				},
-			},
-		},
-	})
+	}
 }
 
 // ---------------------------------------------------------------------------

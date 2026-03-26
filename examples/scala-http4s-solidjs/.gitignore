@@ -1,0 +1,10 @@
+.bsp/
+.idea/
+target/
+project/target/
+project/project/
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+*.class
+*.log

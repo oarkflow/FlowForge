@@ -294,10 +294,13 @@ const PipelineDetailPage: Component = () => {
 	const handleTrigger = async () => {
 		setTriggering(true);
 		try {
-			await api.pipelines.trigger(params.id, params.pid, { branch: triggerBranch().trim() || 'main' });
+			const newRun = await api.pipelines.trigger(params.id, params.pid, { branch: triggerBranch().trim() || 'main' });
 			setShowTrigger(false);
-			toast.success('Pipeline triggered');
-			refetch();
+			toast.success(`Pipeline triggered — Run #${newRun.number}`);
+			// Navigate after a microtask to let the modal close cleanly
+			setTimeout(() => {
+				navigate(`/projects/${params.id}/pipelines/${params.pid}/runs/${newRun.id}`);
+			}, 0);
 		} catch (err) {
 			const msg = err instanceof ApiRequestError ? err.message : 'Failed to trigger pipeline';
 			toast.error(msg);

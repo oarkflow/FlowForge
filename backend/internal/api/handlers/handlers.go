@@ -28,6 +28,7 @@ import (
 // This avoids a direct dependency on the engine package.
 type PipelineEngine interface {
 	TriggerPipeline(ctx context.Context, pipelineID, triggerType string, triggerData map[string]string) (*models.PipelineRun, error)
+	CancelRun(runID string) bool
 }
 
 type Handler struct {
@@ -1208,6 +1209,9 @@ func (h *Handler) CancelRun(c fiber.Ctx) error {
 	if err := h.repo.Runs.UpdateStatus(c.Context(), runID, "cancelled"); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to cancel run")
 	}
+
+	// Signal the running goroutine to stop via context cancellation
+	h.engine.CancelRun(runID)
 
 	_ = h.audit.LogAction(c.Context(), getUserID(c), getClientIP(c), "cancel", "pipeline_run", runID, nil)
 

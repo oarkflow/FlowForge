@@ -1,0 +1,20 @@
+{
+  "name": "scala-http4s-solidjs-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "echo 'no linter configured'",
+    "test": "echo 'no tests configured'"
+  },
+  "dependencies": {
+    "solid-js": "^1.8.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0",
+    "vite-plugin-solid": "^2.10.0",
+    "typescript": "^5.4.0"
+  }
+}

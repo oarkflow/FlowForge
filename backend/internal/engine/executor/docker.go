@@ -156,6 +156,22 @@ func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, step ExecutionStep
 		e.removeContainer(removeCtx, containerID)
 	}()
 
+	// Watch for context cancellation and stop the container immediately.
+	// This ensures that when a user cancels a build, the running container
+	// is stopped rather than continuing to run until it finishes naturally.
+	containerDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			e.stopContainer(stopCtx, containerID)
+		case <-containerDone:
+			// Container finished naturally, nothing to stop
+		}
+	}()
+	defer close(containerDone)
+
 	start := time.Now()
 
 	// Start container
@@ -188,10 +204,6 @@ func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, step ExecutionStep
 	}
 
 	if ctx.Err() == context.DeadlineExceeded {
-		// Try to stop the container
-		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		e.stopContainer(stopCtx, containerID)
 		return result, fmt.Errorf("step %q timed out after %s", step.Name, step.Timeout)
 	}
 	if ctx.Err() == context.Canceled {

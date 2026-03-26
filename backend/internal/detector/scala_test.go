@@ -302,10 +302,12 @@ func TestGenerateScalaPipeline_Basic(t *testing.T) {
 	// Verify key elements are present.
 	checks := []string{
 		"Scala CI/CD",
-		"eclipse-temurin:8-jdk",
+		"sbtscala/scala-sbt:",
 		"sbt test",
 		"sbt clean assembly",
 		"Scala version: 2.11.7",
+		"deploy-local",
+		"Application available at",
 	}
 	for _, check := range checks {
 		if !strings.Contains(yaml, check) {
@@ -358,12 +360,15 @@ func TestGenerateScalaPipeline_WithSolidJSFrontend(t *testing.T) {
 	// Scala, the pipeline should include a frontend build stage.
 	checks := []string{
 		"Scala CI/CD",
-		"eclipse-temurin:8-jdk",
+		"sbtscala/scala-sbt:",
 		"sbt test",
 		"build-frontend",
 		"node:20-alpine",
-		"npm ci",
+		"npm install",
 		"npm run build",
+		"deploy-local",
+		"Deploy to Docker",
+		"Application available at",
 	}
 	for _, check := range checks {
 		if !strings.Contains(yaml, check) {

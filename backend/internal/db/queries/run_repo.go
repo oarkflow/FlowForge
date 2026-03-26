@@ -91,6 +91,11 @@ func (r *RunRepo) GetNextNumber(ctx context.Context, pipelineID string) (int, er
 	return n, err
 }
 
+func (r *RunRepo) SetDeployURL(ctx context.Context, id, url string) error {
+	_, err := r.db.ExecContext(ctx, "UPDATE pipeline_runs SET deploy_url = ? WHERE id = ?", url, id)
+	return err
+}
+
 // StageRun
 func (r *RunRepo) CreateStageRun(ctx context.Context, s *models.StageRun) error {
 	s.ID = uuid.New().String()

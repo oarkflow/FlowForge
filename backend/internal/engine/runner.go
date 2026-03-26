@@ -97,7 +97,7 @@ func (r *Runner) runStagesSequential(ctx context.Context, runID string, config s
 	for i, stageCfg := range config.Stages {
 		if err := ctx.Err(); err != nil {
 			for j := i; j < len(config.Stages); j++ {
-				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[j], "cancelled")
+				r.repos.Runs.UpdateStageRunStatus(context.Background(), ids.stageIDs[j], "cancelled")
 				r.broadcastStatusChange(runID, "stage", ids.stageIDs[j], config.Stages[j].Name, "cancelled")
 			}
 			return fmt.Errorf("pipeline cancelled: %w", err)
@@ -105,7 +105,7 @@ func (r *Runner) runStagesSequential(ctx context.Context, runID string, config s
 
 		if err := r.runStage(ctx, runID, ids.stageIDs[i], stageCfg, ids.jobIDs[i], ids.stepIDs[i], volumeName); err != nil {
 			for j := i + 1; j < len(config.Stages); j++ {
-				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[j], "skipped")
+				r.repos.Runs.UpdateStageRunStatus(context.Background(), ids.stageIDs[j], "skipped")
 				r.broadcastStatusChange(runID, "stage", ids.stageIDs[j], config.Stages[j].Name, "skipped")
 			}
 			return fmt.Errorf("stage %q failed: %w", stageCfg.Name, err)
@@ -134,7 +134,7 @@ func (r *Runner) runStagesDAG(ctx context.Context, runID string, config schedule
 			for li := levelIdx; li < len(dag.Levels); li++ {
 				for _, stageName := range dag.Levels[li] {
 					idx := stageByName[stageName]
-					r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[idx], "cancelled")
+					r.repos.Runs.UpdateStageRunStatus(context.Background(), ids.stageIDs[idx], "cancelled")
 					r.broadcastStatusChange(runID, "stage", ids.stageIDs[idx], stageName, "cancelled")
 				}
 			}
@@ -162,7 +162,7 @@ func (r *Runner) runStagesDAG(ctx context.Context, runID string, config schedule
 			failedMu.Unlock()
 
 			if shouldSkip {
-				r.repos.Runs.UpdateStageRunStatus(ctx, ids.stageIDs[stageIdx], "skipped")
+				r.repos.Runs.UpdateStageRunStatus(context.Background(), ids.stageIDs[stageIdx], "skipped")
 				r.broadcastStatusChange(runID, "stage", ids.stageIDs[stageIdx], stageName, "skipped")
 				r.broadcastLog(runID, "", "system", fmt.Sprintf("Stage %q skipped (dependency failed)\n", stageName))
 				failedMu.Lock()
@@ -296,17 +296,23 @@ func (r *Runner) runStage(ctx context.Context, runID, stageRunID string, stageCf
 
 	// Determine stage status
 	status := "success"
-	if len(jobErrs) > 0 {
+	if ctx.Err() != nil {
+		status = "cancelled"
+	} else if len(jobErrs) > 0 {
 		status = "failure"
 	}
 
-	if err := r.repos.Runs.SetStageRunFinished(ctx, stageRunID, status); err != nil {
+	// Use background context for final DB updates in case ctx is cancelled
+	if err := r.repos.Runs.SetStageRunFinished(context.Background(), stageRunID, status); err != nil {
 		log.Error().Err(err).Str("stage_run_id", stageRunID).Msg("runner: failed to update stage status")
 	}
 
 	r.broadcastStatusChange(runID, "stage", stageRunID, stageCfg.Name, status)
 	r.broadcastLog(runID, "", "system", fmt.Sprintf("=== Stage: %s — %s ===\n", stageCfg.Name, status))
 
+	if status == "cancelled" {
+		return fmt.Errorf("stage %q: cancelled", stageCfg.Name)
+	}
 	if status == "failure" {
 		return fmt.Errorf("stage %q: %d job(s) failed", stageCfg.Name, len(jobErrs))
 	}
@@ -344,14 +350,22 @@ func (r *Runner) runJob(ctx context.Context, runID, jobRunID string, jobCfg sche
 	// Execute steps sequentially
 	for k, stepCfg := range jobCfg.Steps {
 		if err := ctx.Err(); err != nil {
-			r.failJob(ctx, runID, jobRunID, stepIDs[k:], "cancelled")
+			// Mark remaining steps as cancelled using background context
+			for _, remainingID := range stepIDs[k:] {
+				r.repos.Runs.UpdateStepRunStatus(context.Background(), remainingID, "cancelled")
+				r.broadcastStatusChange(runID, "step", remainingID, "", "cancelled")
+			}
+			if updateErr := r.repos.Runs.UpdateJobRunStatus(context.Background(), jobRunID, "cancelled"); updateErr != nil {
+				log.Error().Err(updateErr).Str("job_run_id", jobRunID).Msg("runner: failed to mark job as cancelled")
+			}
+			r.broadcastStatusChange(runID, "job", jobRunID, jobCfg.Name, "cancelled")
 			return fmt.Errorf("job cancelled: %w", err)
 		}
 
 		if err := r.runStep(ctx, runID, stepIDs[k], stepCfg, exec); err != nil {
 			// Mark remaining steps as skipped
 			for _, remainingStepID := range stepIDs[k+1:] {
-				r.repos.Runs.UpdateStepRunStatus(ctx, remainingStepID, "skipped")
+				r.repos.Runs.UpdateStepRunStatus(context.Background(), remainingStepID, "skipped")
 				r.broadcastStatusChange(runID, "step", remainingStepID, "", "skipped")
 			}
 			r.failJobStatus(ctx, runID, jobRunID)
@@ -419,6 +433,14 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 				lastStderrLine = line
 			}
 		}
+		// Detect deploy URL in log output (e.g. "Application available at http://localhost:8080")
+		if stream == "stdout" {
+			if url := extractDeployURL(string(content)); url != "" {
+				if err := r.repos.Runs.SetDeployURL(ctx, runID, url); err != nil {
+					log.Error().Err(err).Msg("runner: failed to persist deploy URL")
+				}
+			}
+		}
 		r.broadcastLogEntry(runID, stepRunID, stream, content)
 	}
 
@@ -454,6 +476,24 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 	}
 
 	if execErr != nil || (result != nil && result.ExitCode != 0) {
+		// Use background context for DB writes since ctx may be cancelled
+		dbCtx := context.Background()
+
+		// Distinguish cancellation from failure
+		if ctx.Err() == context.Canceled {
+			stepRun.Status = "cancelled"
+			errMsg := "cancelled by user"
+			stepRun.ErrorMessage = &errMsg
+
+			if updateErr := r.repos.Runs.UpdateStepRun(dbCtx, stepRun); updateErr != nil {
+				log.Error().Err(updateErr).Str("step_run_id", stepRunID).Msg("runner: failed to update step run")
+			}
+
+			r.broadcastStatusChange(runID, "step", stepRunID, stepCfg.Name, "cancelled")
+			r.broadcastLog(runID, stepRunID, "system", fmt.Sprintf("<<< Step: %s — CANCELLED\n", stepCfg.Name))
+			return fmt.Errorf("step %q: cancelled", stepCfg.Name)
+		}
+
 		stepRun.Status = "failure"
 		errMsg := ""
 		if execErr != nil {
@@ -472,7 +512,7 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 		}
 		stepRun.ErrorMessage = &errMsg
 
-		if updateErr := r.repos.Runs.UpdateStepRun(ctx, stepRun); updateErr != nil {
+		if updateErr := r.repos.Runs.UpdateStepRun(dbCtx, stepRun); updateErr != nil {
 			log.Error().Err(updateErr).Str("step_run_id", stepRunID).Msg("runner: failed to update step run")
 		}
 
@@ -482,7 +522,7 @@ func (r *Runner) runStep(ctx context.Context, runID, stepRunID string, stepCfg s
 	}
 
 	stepRun.Status = "success"
-	if updateErr := r.repos.Runs.UpdateStepRun(ctx, stepRun); updateErr != nil {
+	if updateErr := r.repos.Runs.UpdateStepRun(context.Background(), stepRun); updateErr != nil {
 		log.Error().Err(updateErr).Str("step_run_id", stepRunID).Msg("runner: failed to update step run")
 	}
 
@@ -559,6 +599,21 @@ func lastNonEmptyLine(s string) string {
 		line := strings.TrimSpace(lines[i])
 		if line != "" {
 			return line
+		}
+	}
+	return ""
+}
+
+// extractDeployURL looks for "Application available at <URL>" in log output
+// and returns the URL if found. This is emitted by the deploy-local pipeline stage.
+func extractDeployURL(s string) string {
+	const marker = "Application available at "
+	for _, line := range strings.Split(s, "\n") {
+		if idx := strings.Index(line, marker); idx >= 0 {
+			url := strings.TrimSpace(line[idx+len(marker):])
+			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+				return url
+			}
 		}
 	}
 	return ""

@@ -136,17 +136,18 @@ func main() {
 	app.Use(cors.New(cors.Config{AllowOrigins: []string{cfg.AllowedOrigins}}))
 	app.Use(compress.New())
 	app.Use(middleware.RequestLogger(appLog))
+
+	// WebSocket routes — registered BEFORE the rate limiter so real-time
+	// connections are not throttled or rejected by per-IP limits.
+	app.Get("/ws/runs/:runId/logs", wsHandler.HandleRunLogs)
+	app.Get("/ws/events", wsHandler.HandleEvents)
+	app.Get("/sse/runs/:runId/logs", wsHandler.SSEHandler)
+
+	// Rate limiter applies only to REST API routes (registered after this point)
 	app.Use(middleware.RateLimiter(100, time.Minute))
 
 	// Register REST API routes
 	api.RegisterRoutes(app, database, cfg, importSvc, agentServer, eng)
-
-	// WebSocket routes
-	app.Get("/ws/runs/:runId/logs", wsHandler.HandleRunLogs)
-	app.Get("/ws/events", wsHandler.HandleEvents)
-
-	// SSE fallback
-	app.Get("/sse/runs/:runId/logs", wsHandler.SSEHandler)
 
 	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

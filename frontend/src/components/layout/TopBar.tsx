@@ -139,7 +139,7 @@ const TopBar: Component<{ onOpenSearch?: () => void }> = (props) => {
 			{/* Left: search bar that opens command palette */}
 			<div class="flex items-center gap-3">
 				<button
-					class="relative flex items-center gap-2 w-64 pl-9 pr-3 py-1.5 text-sm rounded-lg bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] text-[var(--color-text-tertiary)] hover:border-[var(--color-border-focus)] focus:outline-none transition-colors cursor-pointer"
+					class="relative flex items-center gap-2 w-100 pl-9 pr-3 py-1.5 text-sm rounded-lg bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] text-[var(--color-text-tertiary)] hover:border-[var(--color-border-focus)] focus:outline-none transition-colors cursor-pointer"
 					onClick={() => props.onOpenSearch?.()}
 				>
 					<svg

@@ -51,13 +51,21 @@ type RunFunc func(ctx context.Context, pipelineRunID string, config PipelineConf
 // It receives the context, the run ID, and the final status.
 type OnCompleteFunc func(ctx context.Context, runID string, status string)
 
+// RegisterCancelFunc is called when a run starts to register its cancel function.
+type RegisterCancelFunc func(runID string, cancel context.CancelFunc)
+
+// UnregisterCancelFunc is called when a run finishes to clean up its cancel function.
+type UnregisterCancelFunc func(runID string)
+
 // Scheduler polls the priority queue and dispatches jobs for execution.
 type Scheduler struct {
-	queue        *queue.PriorityQueue
-	repos        *queries.Repositories
-	hub          *websocket.Hub
-	runFn        RunFunc
-	onCompleteFn OnCompleteFunc
+	queue              *queue.PriorityQueue
+	repos              *queries.Repositories
+	hub                *websocket.Hub
+	runFn              RunFunc
+	onCompleteFn       OnCompleteFunc
+	registerCancelFn   RegisterCancelFunc
+	unregisterCancelFn UnregisterCancelFunc
 }
 
 // New creates a new Scheduler.
@@ -79,6 +87,12 @@ func (s *Scheduler) SetRunFunc(fn RunFunc) {
 // This is used by the engine for pipeline composition (downstream triggers).
 func (s *Scheduler) SetOnCompleteFunc(fn OnCompleteFunc) {
 	s.onCompleteFn = fn
+}
+
+// SetCancelFuncs sets the register/unregister callbacks for per-run cancellation.
+func (s *Scheduler) SetCancelFuncs(register RegisterCancelFunc, unregister UnregisterCancelFunc) {
+	s.registerCancelFn = register
+	s.unregisterCancelFn = unregister
 }
 
 // Start begins the scheduling loop. It blocks until ctx is cancelled.
@@ -142,11 +156,25 @@ func (s *Scheduler) dispatch(ctx context.Context, job *queue.Job) {
 	runID := job.PipelineRunID
 	log.Info().Str("run_id", runID).Str("job_id", job.ID).Msg("scheduler: dispatching job")
 
+	// Create a per-run child context so cancellation targets this run only
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	// Register the cancel func so the API can cancel this specific run
+	if s.registerCancelFn != nil {
+		s.registerCancelFn(runID, runCancel)
+	}
+	defer func() {
+		if s.unregisterCancelFn != nil {
+			s.unregisterCancelFn(runID)
+		}
+	}()
+
 	// Broadcast a status update
 	s.broadcastStatus(runID, "running")
 
 	// Mark the pipeline run as started
-	if err := s.repos.Runs.SetStarted(ctx, runID); err != nil {
+	if err := s.repos.Runs.SetStarted(runCtx, runID); err != nil {
 		log.Error().Err(err).Str("run_id", runID).Msg("scheduler: failed to mark run as started")
 	}
 
@@ -155,20 +183,32 @@ func (s *Scheduler) dispatch(ctx context.Context, job *queue.Job) {
 	if err := json.Unmarshal(job.Config, &config); err != nil {
 		errMsg := fmt.Sprintf("scheduler: failed to parse pipeline config: %v", err)
 		log.Error().Str("run_id", runID).Msg(errMsg)
-		s.finishRun(ctx, runID, "failure", 0, errMsg)
+		s.finishRun(runCtx, runID, "failure", 0, errMsg)
 		return
 	}
 
 	// Execute the pipeline via the registered run function
 	if s.runFn == nil {
 		log.Error().Str("run_id", runID).Msg("scheduler: no run function registered")
-		s.finishRun(ctx, runID, "failure", 0, "no run function registered")
+		s.finishRun(runCtx, runID, "failure", 0, "no run function registered")
 		return
 	}
 
 	start := time.Now()
-	err := s.runFn(ctx, runID, config)
+	err := s.runFn(runCtx, runID, config)
 	durationMs := int(time.Since(start).Milliseconds())
+
+	// Check if the run was cancelled — use the original ctx to read/write DB
+	// since runCtx is now cancelled
+	if runCtx.Err() == context.Canceled {
+		// Check if the DB status is already "cancelled" (set by the API handler)
+		run, dbErr := s.repos.Runs.GetByID(ctx, runID)
+		if dbErr == nil && run.Status == "cancelled" {
+			log.Info().Str("run_id", runID).Msg("scheduler: run was cancelled by user")
+			s.finishRun(ctx, runID, "cancelled", durationMs, "cancelled by user")
+			return
+		}
+	}
 
 	if err != nil {
 		log.Error().Err(err).Str("run_id", runID).Msg("scheduler: pipeline run failed")

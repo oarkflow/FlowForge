@@ -36,6 +36,10 @@ type Engine struct {
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// runCancellers holds a context.CancelFunc for every in-flight pipeline
+	// run so the API can cancel a specific run by calling CancelRun(runID).
+	runCancellers sync.Map // map[string]context.CancelFunc
 }
 
 // New creates a new Engine with the given database, WebSocket hub, and configuration.
@@ -68,6 +72,9 @@ func New(db *sqlx.DB, hub *websocket.Hub, cfg *config.Config) *Engine {
 
 	// Wire the scheduler's completion callback for pipeline composition
 	sched.SetOnCompleteFunc(e.onRunComplete)
+
+	// Wire cancel registration so the API can cancel specific runs
+	sched.SetCancelFuncs(e.RegisterRunCancel, e.UnregisterRunCancel)
 
 	return e
 }
@@ -129,6 +136,30 @@ func (e *Engine) Stop() {
 	e.queue.Close()
 	e.wg.Wait()
 	log.Info().Msg("engine: stopped")
+}
+
+// CancelRun cancels a specific in-flight pipeline run by invoking its context
+// cancel function. Returns true if the run was found and cancelled.
+func (e *Engine) CancelRun(runID string) bool {
+	if fn, ok := e.runCancellers.LoadAndDelete(runID); ok {
+		log.Info().Str("run_id", runID).Msg("engine: cancelling run")
+		fn.(context.CancelFunc)()
+		return true
+	}
+	log.Warn().Str("run_id", runID).Msg("engine: no active run found to cancel")
+	return false
+}
+
+// RegisterRunCancel stores a cancel function for the given run ID.
+// Called by the scheduler when dispatching a run.
+func (e *Engine) RegisterRunCancel(runID string, cancel context.CancelFunc) {
+	e.runCancellers.Store(runID, cancel)
+}
+
+// UnregisterRunCancel removes the cancel function for the given run ID.
+// Called by the scheduler when a run completes.
+func (e *Engine) UnregisterRunCancel(runID string) {
+	e.runCancellers.Delete(runID)
 }
 
 // TriggerPipeline creates a new pipeline run and enqueues it for execution.
