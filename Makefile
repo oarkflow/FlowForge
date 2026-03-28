@@ -2,9 +2,17 @@
 # FlowForge CI/CD Platform — Makefile
 # ==============================================================================
 
-.PHONY: help dev dev-down build test test-backend test-frontend lint \
-        docker-build docker-up docker-down clean migrate seed \
-        fmt vet proto
+WEB_DIR := web
+DIST_DIR := dist
+SERVER_CMD := ./cmd/server
+
+.PHONY: help dev dev-down dev-backend dev-web dev-frontend \
+        build build-backend build-web build-frontend \
+        test test-backend test-web test-frontend test-integration \
+        lint lint-backend lint-web lint-frontend \
+        docker-build docker-up docker-down docker-logs docker-ps \
+        clean clean-docker migrate seed fmt vet proto \
+        k8s-apply k8s-delete
 
 # Default target
 help: ## Show this help message
@@ -22,60 +30,69 @@ dev-down: ## Stop development environment
 	docker compose -f docker-compose.dev.yml down
 
 dev-backend: ## Run backend locally (no Docker)
-	cd backend && CGO_ENABLED=1 go run ./cmd/server
+	CGO_ENABLED=1 go run $(SERVER_CMD)
 
-dev-frontend: ## Run frontend locally (no Docker)
-	cd frontend && npm run dev
+dev-web: ## Run web app locally (no Docker)
+	cd $(WEB_DIR) && npm run dev
+
+dev-frontend: dev-web ## Backward-compatible alias for dev-web
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
-build: build-backend build-frontend ## Build backend and frontend
+build: build-backend build-web ## Build backend and web app
 
 build-backend: ## Build Go backend binary
-	cd backend && CGO_ENABLED=1 go build -ldflags="-w -s" -trimpath -o ../dist/flowforge-server ./cmd/server
+	@mkdir -p $(DIST_DIR)
+	CGO_ENABLED=1 go build -ldflags="-w -s" -trimpath -o $(DIST_DIR)/flowforge-server $(SERVER_CMD)
 
-build-frontend: ## Build frontend production bundle
-	cd frontend && npm ci && npm run build
+build-web: ## Build web production bundle
+	cd $(WEB_DIR) && npm ci && npm run build
+
+build-frontend: build-web ## Backward-compatible alias for build-web
 
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
 
-test: test-backend test-frontend ## Run all tests
+test: test-backend test-web ## Run all tests
 
 test-backend: ## Run backend tests
-	cd backend && CGO_ENABLED=1 go test ./... -race -cover -timeout 120s
+	CGO_ENABLED=1 go test ./... -race -cover -timeout 120s
 
-test-frontend: ## Run frontend tests
-	cd frontend && npm test 2>/dev/null || echo "No test script configured"
+test-web: ## Run web tests
+	cd $(WEB_DIR) && npm test 2>/dev/null || echo "No test script configured"
+
+test-frontend: test-web ## Backward-compatible alias for test-web
 
 test-integration: ## Run integration tests (requires Docker)
 	docker compose -f docker-compose.dev.yml up -d
 	@echo "Waiting for services to be ready..."
 	@sleep 5
-	cd backend && go test ./... -tags=integration -race -timeout 300s
+	go test ./... -tags=integration -race -timeout 300s
 	docker compose -f docker-compose.dev.yml down
 
 # ---------------------------------------------------------------------------
 # Code Quality
 # ---------------------------------------------------------------------------
 
-lint: lint-backend lint-frontend ## Run all linters
+lint: lint-backend lint-web ## Run all linters
 
 lint-backend: ## Lint Go code
-	cd backend && go vet ./...
-	@which golangci-lint > /dev/null 2>&1 && cd backend && golangci-lint run ./... || echo "golangci-lint not installed, skipping"
+	go vet ./...
+	@which golangci-lint > /dev/null 2>&1 && golangci-lint run ./... || echo "golangci-lint not installed, skipping"
 
-lint-frontend: ## Lint frontend code
-	cd frontend && npm run typecheck 2>/dev/null || echo "No typecheck script configured"
+lint-web: ## Lint web code
+	cd $(WEB_DIR) && npm run typecheck 2>/dev/null || echo "No typecheck script configured"
+
+lint-frontend: lint-web ## Backward-compatible alias for lint-web
 
 fmt: ## Format Go code
-	cd backend && gofmt -w -s .
+	gofmt -w -s .
 
 vet: ## Run go vet
-	cd backend && go vet ./...
+	go vet ./...
 
 # ---------------------------------------------------------------------------
 # Docker
@@ -101,7 +118,7 @@ docker-ps: ## Show running containers
 # ---------------------------------------------------------------------------
 
 migrate: ## Run database migrations
-	cd backend && go run ./cmd/server -migrate
+	go run $(SERVER_CMD) -migrate
 
 seed: ## Seed database with sample data
 	@test -f scripts/seed-db.sh && bash scripts/seed-db.sh || echo "Seed script not found"
@@ -112,17 +129,17 @@ seed: ## Seed database with sample data
 
 proto: ## Generate protobuf Go code
 	@test -f scripts/gen-proto.sh && bash scripts/gen-proto.sh || \
-		(cd backend && protoc --go_out=. --go-grpc_out=. proto/agent.proto 2>/dev/null || echo "protoc not installed")
+		(protoc --go_out=. --go-grpc_out=. proto/agent.proto 2>/dev/null || echo "protoc not installed")
 
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
 clean: ## Remove build artifacts and temporary files
-	rm -rf dist/
-	rm -rf frontend/dist/
+	rm -rf $(DIST_DIR)/
+	rm -rf $(WEB_DIR)/dist/
 	rm -rf data/
-	rm -rf backend/tmp/
+	rm -rf tmp/
 	docker compose down -v 2>/dev/null || true
 	docker compose -f docker-compose.dev.yml down -v 2>/dev/null || true
 
