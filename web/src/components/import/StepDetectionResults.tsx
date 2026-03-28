@@ -2,10 +2,11 @@ import type { Component } from 'solid-js';
 import { For, Show, createMemo } from 'solid-js';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
-import type { DetectionResult, ExtractedVariable } from '../../types';
+import type { DetectionResult, ExtractedVariable, ImportProjectProfile } from '../../types';
 
 interface Props {
   detections: DetectionResult[];
+  profile: ImportProjectProfile | null;
   generatedPipeline: string;
   editedPipeline: string;
   onEditPipeline: (yaml: string) => void;
@@ -33,6 +34,10 @@ const StepDetectionResults: Component<Props> = (props) => {
   const hasRequiredConfig = createMemo(() =>
     props.extractedSecrets.length > 0 || needsConfigEnvVars().length > 0
   );
+
+  const services = createMemo(() => props.profile?.services ?? []);
+  const commands = createMemo(() => props.profile?.commands ?? {});
+  const deploymentTargets = createMemo(() => props.profile?.deployment_targets ?? []);
 
   return (
     <div>
@@ -86,6 +91,120 @@ const StepDetectionResults: Component<Props> = (props) => {
           </div>
         </Show>
       </div>
+
+      <Show when={props.profile}>
+        <div class="mb-6 p-4 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border-primary)] space-y-4">
+          <div>
+            <h3 class="text-sm font-medium text-[var(--color-text-primary)] mb-2">
+              Project Profile
+            </h3>
+            <div class="flex flex-wrap gap-2">
+              <Show when={props.profile?.primary_language}>
+                <Badge variant="success" size="sm">{props.profile?.primary_language}</Badge>
+              </Show>
+              <Show when={props.profile?.primary_framework}>
+                <Badge variant="default" size="sm">{props.profile?.primary_framework}</Badge>
+              </Show>
+              <Show when={props.profile?.monorepo}>
+                <Badge variant="warning" size="sm">Monorepo</Badge>
+              </Show>
+              <Show when={props.profile?.has_flowforge_config}>
+                <Badge variant="success" size="sm">Existing FlowForge Config</Badge>
+              </Show>
+            </div>
+          </div>
+
+          <Show when={(props.profile?.package_managers?.length ?? 0) > 0 || (props.profile?.dependency_files?.length ?? 0) > 0 || (props.profile?.env_files?.length ?? 0) > 0}>
+            <div class="grid gap-4 md:grid-cols-3">
+              <Show when={(props.profile?.package_managers?.length ?? 0) > 0}>
+                <div>
+                  <p class="text-xs font-medium text-[var(--color-text-secondary)] mb-2">Package Managers</p>
+                  <div class="flex flex-wrap gap-2">
+                    <For each={props.profile?.package_managers ?? []}>{(item) => (
+                      <span class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-mono bg-[var(--color-bg-tertiary)] text-[var(--color-text-primary)] border border-[var(--color-border-primary)]">
+                        {item}
+                      </span>
+                    )}</For>
+                  </div>
+                </div>
+              </Show>
+              <Show when={(props.profile?.dependency_files?.length ?? 0) > 0}>
+                <div>
+                  <p class="text-xs font-medium text-[var(--color-text-secondary)] mb-2">Dependency Files</p>
+                  <div class="space-y-1">
+                    <For each={props.profile?.dependency_files?.slice(0, 8) ?? []}>{(item) => (
+                      <p class="text-xs font-mono text-[var(--color-text-tertiary)]">{item}</p>
+                    )}</For>
+                  </div>
+                </div>
+              </Show>
+              <Show when={(props.profile?.env_files?.length ?? 0) > 0}>
+                <div>
+                  <p class="text-xs font-medium text-[var(--color-text-secondary)] mb-2">Environment Files</p>
+                  <div class="space-y-1">
+                    <For each={props.profile?.env_files?.slice(0, 8) ?? []}>{(item) => (
+                      <p class="text-xs font-mono text-[var(--color-text-tertiary)]">{item}</p>
+                    )}</For>
+                  </div>
+                </div>
+              </Show>
+            </div>
+          </Show>
+
+          <Show when={services().length > 0}>
+            <div>
+              <p class="text-xs font-medium text-[var(--color-text-secondary)] mb-2">Detected Services</p>
+              <div class="space-y-2">
+                <For each={services().slice(0, 6)}>{(service) => (
+                  <div class="p-3 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)]">
+                    <div class="flex flex-wrap items-center gap-2 mb-1">
+                      <span class="text-sm font-medium text-[var(--color-text-primary)]">{service.name}</span>
+                      <span class="text-xs font-mono text-[var(--color-text-tertiary)]">{service.path}</span>
+                      <Show when={service.language}>
+                        <Badge variant="default" size="sm">{service.language}</Badge>
+                      </Show>
+                      <Show when={service.framework}>
+                        <Badge variant="success" size="sm">{service.framework}</Badge>
+                      </Show>
+                    </div>
+                    <Show when={(service.dependencies?.length ?? 0) > 0}>
+                      <p class="text-xs text-[var(--color-text-tertiary)]">
+                        Dependencies: {(service.dependencies ?? []).slice(0, 6).join(', ')}
+                      </p>
+                    </Show>
+                  </div>
+                )}</For>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={commands().install || commands().test || commands().build || commands().lint || commands().run}>
+            <div>
+              <p class="text-xs font-medium text-[var(--color-text-secondary)] mb-2">Suggested Commands</p>
+              <div class="grid gap-2 md:grid-cols-2">
+                <Show when={commands().install}><p class="text-xs font-mono text-[var(--color-text-tertiary)]">install: {commands().install}</p></Show>
+                <Show when={commands().lint}><p class="text-xs font-mono text-[var(--color-text-tertiary)]">lint: {commands().lint}</p></Show>
+                <Show when={commands().test}><p class="text-xs font-mono text-[var(--color-text-tertiary)]">test: {commands().test}</p></Show>
+                <Show when={commands().build}><p class="text-xs font-mono text-[var(--color-text-tertiary)]">build: {commands().build}</p></Show>
+                <Show when={commands().run}><p class="text-xs font-mono text-[var(--color-text-tertiary)]">run: {commands().run}</p></Show>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={deploymentTargets().length > 0}>
+            <div>
+              <p class="text-xs font-medium text-[var(--color-text-secondary)] mb-2">Deployment Signals</p>
+              <div class="flex flex-wrap gap-2">
+                <For each={deploymentTargets().slice(0, 8)}>{(target) => (
+                  <span class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-mono bg-[var(--color-bg-tertiary)] text-[var(--color-text-primary)] border border-[var(--color-border-primary)]">
+                    {target.type}: {target.path}
+                  </span>
+                )}</For>
+              </div>
+            </div>
+          </Show>
+        </div>
+      </Show>
 
       {/* Pipeline editor */}
       <div class="mb-6">

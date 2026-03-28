@@ -161,11 +161,14 @@ func shouldSkipDir(name string) bool {
 // languages, frameworks, and dependency information sorted by confidence
 // (highest first).
 func Detect(rootDir string) ([]DetectionResult, error) {
-	idx, err := buildFileIndex(rootDir)
+	inspection, err := Inspect(rootDir)
 	if err != nil {
 		return nil, err
 	}
+	return inspection.Detections, nil
+}
 
+func detectWithIndex(idx *fileIndex) []DetectionResult {
 	var results []DetectionResult
 
 	// Run all language detectors.
@@ -184,7 +187,7 @@ func Detect(rootDir string) ([]DetectionResult, error) {
 		return results[i].Confidence > results[j].Confidence
 	})
 
-	return results, nil
+	return results
 }
 
 // DetectLanguage is the main entry point — an alias for Detect that

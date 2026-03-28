@@ -814,8 +814,8 @@ func (h *Handler) SyncRepository(c fiber.Ctx) error {
 	// Mark last sync time — actual sync logic would be handled by the engine
 	_ = repo
 	return c.JSON(fiber.Map{
-		"message":     "sync initiated",
-		"repository":  repo.FullName,
+		"message":      "sync initiated",
+		"repository":   repo.FullName,
 		"last_sync_at": time.Now(),
 	})
 }
@@ -875,7 +875,7 @@ func (h *Handler) CreatePipeline(c fiber.Ctx) error {
 		}
 		if len(validationErrs) > 0 {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error":            "pipeline config validation failed",
+				"error":             "pipeline config validation failed",
 				"validation_errors": validationErrs,
 			})
 		}
@@ -995,7 +995,7 @@ func (h *Handler) UpdatePipeline(c fiber.Ctx) error {
 			}
 			if len(validationErrs) > 0 {
 				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"error":            "pipeline config validation failed",
+					"error":             "pipeline config validation failed",
 					"validation_errors": validationErrs,
 				})
 			}
@@ -1056,9 +1056,9 @@ func (h *Handler) ListPipelineVersions(c fiber.Ctx) error {
 }
 
 type triggerPipelineInput struct {
-	Branch  *string            `json:"branch"`
-	Tag     *string            `json:"tag"`
-	Inputs  map[string]string  `json:"inputs"`
+	Branch *string           `json:"branch"`
+	Tag    *string           `json:"tag"`
+	Inputs map[string]string `json:"inputs"`
 }
 
 func (h *Handler) TriggerPipeline(c fiber.Ctx) error {
@@ -1128,7 +1128,7 @@ func (h *Handler) ValidatePipeline(c fiber.Ctx) error {
 
 	if len(validationErrs) > 0 {
 		return c.JSON(fiber.Map{
-			"valid":            false,
+			"valid":             false,
 			"validation_errors": validationErrs,
 		})
 	}
@@ -1181,6 +1181,7 @@ func (h *Handler) GetRun(c fiber.Ctx) error {
 	stages, _ := h.repo.Runs.ListStageRuns(c.Context(), run.ID)
 	jobs, _ := h.repo.Runs.ListJobRunsByRunID(c.Context(), run.ID)
 	steps, _ := h.repo.Runs.ListStepRunsByRunID(c.Context(), run.ID)
+	stages, jobs, steps = normalizeRunHierarchy(run, stages, jobs, steps)
 
 	type enrichedRun struct {
 		*models.PipelineRun
@@ -1737,8 +1738,8 @@ func (h *Handler) HealthCheck(c fiber.Ctx) error {
 	// Verify database is reachable
 	if err := h.db.PingContext(c.Context()); err != nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"status":  "unhealthy",
-			"error":   "database unreachable",
+			"status": "unhealthy",
+			"error":  "database unreachable",
 		})
 	}
 	return c.JSON(fiber.Map{"status": "ok"})
@@ -1782,8 +1783,8 @@ type githubWebhookEvent struct {
 	Ref        string `json:"ref"`
 	Before     string `json:"before"`
 	After      string `json:"after"`
-	Action     string `json:"action,omitempty"`      // PR action: opened, synchronize, reopened, closed
-	RefType    string `json:"ref_type,omitempty"`     // create event: "tag" or "branch"
+	Action     string `json:"action,omitempty"`   // PR action: opened, synchronize, reopened, closed
+	RefType    string `json:"ref_type,omitempty"` // create event: "tag" or "branch"
 	Repository struct {
 		ID       int    `json:"id"`
 		FullName string `json:"full_name"`

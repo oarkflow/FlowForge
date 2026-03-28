@@ -147,6 +147,46 @@ interface LogEntry {
 	step_run_id: string;
 }
 
+function toLogEntry(line: { content: string; stream?: string; step_run_id?: string | null }): LogEntry {
+	return {
+		content: line.content,
+		stream: line.stream || 'stdout',
+		step_run_id: line.step_run_id ?? '',
+	};
+}
+
+function logEntryKey(entry: LogEntry): string {
+	return `${entry.step_run_id}\u0000${entry.stream}\u0000${entry.content}`;
+}
+
+function mergeHistoricalAndLiveLogs(historical: LogEntry[], live: LogEntry[]): LogEntry[] {
+	if (historical.length === 0) return live;
+	if (live.length === 0) return historical;
+
+	const historicalCounts = new Map<string, number>();
+	for (const entry of historical) {
+		const key = logEntryKey(entry);
+		historicalCounts.set(key, (historicalCounts.get(key) ?? 0) + 1);
+	}
+
+	const merged = [...historical];
+	for (const entry of live) {
+		const key = logEntryKey(entry);
+		const remaining = historicalCounts.get(key) ?? 0;
+		if (remaining > 0) {
+			historicalCounts.set(key, remaining - 1);
+			continue;
+		}
+		merged.push(entry);
+	}
+
+	return merged;
+}
+
+function isActiveRunStatus(status?: RunStatus): boolean {
+	return status === 'running' || status === 'queued' || status === 'pending';
+}
+
 // ---------------------------------------------------------------------------
 // Fetcher
 // ---------------------------------------------------------------------------
@@ -264,8 +304,6 @@ const RunDetailPage: Component = () => {
 	// Stages and jobs start collapsed by default (initial state is empty Set).
 	// User clicks to expand what they need.
 
-	// WebSocket for live log streaming
-	let logSocket: ReturnType<typeof createRunLogSocket> | null = null;
 	let statusChangeTimer: ReturnType<typeof setTimeout> | null = null;
 
 	// Debounced refetch to avoid excessive API calls during rapid status changes
@@ -278,46 +316,57 @@ const RunDetailPage: Component = () => {
 	};
 
 	createEffect(() => {
+		params.rid;
+		setLiveLogLines([]);
+	});
+
+	createEffect(() => {
 		const r = run();
-		if (r && (r.status === 'running' || r.status === 'queued' || r.status === 'pending')) {
-			logSocket = createRunLogSocket(r.id);
-			logSocket.on('log', (payload: unknown) => {
-				const line = payload as { step_run_id?: string; content: string; stream?: string };
-				setLiveLogLines(prev => [...prev, {
-					step_run_id: line.step_run_id ?? '',
-					content: line.content,
-					stream: line.stream ?? 'stdout',
-				}]);
-			});
-			logSocket.on('status', (payload: unknown) => {
-				const status = payload as { status?: string };
-				if (status.status === 'success' || status.status === 'failure' || status.status === 'cancelled') {
-					// Run finished — clear live lines since refetch brings full logs from DB
-					setLiveLogLines([]);
-					refetch();
-					logSocket?.disconnect();
-					logSocket = null;
-				} else {
-					// Intermediate status update — keep live logs, just refresh status tree
-					debouncedRefetch();
-				}
-			});
-			logSocket.on('status_change', () => {
-				// Stage/step status changed — refresh status tree but keep accumulated live logs
-				debouncedRefetch();
-			});
-			logSocket.on('replay_complete', () => {
-				// Replay done
-			});
-			logSocket.connect();
-		}
+		if (!r || !isActiveRunStatus(r.status)) return;
+
+		const socket = createRunLogSocket(r.id);
+		const offLog = socket.on('log', (payload: unknown) => {
+			const line = payload as { step_run_id?: string; content: string; stream?: string };
+			setLiveLogLines(prev => [...prev, toLogEntry(line)]);
+		});
+		const offStatus = socket.on('status', (payload: unknown) => {
+			const status = payload as { status?: string };
+			if (status.status === 'success' || status.status === 'failure' || status.status === 'cancelled') {
+				setLiveLogLines([]);
+				refetch();
+				socket.disconnect();
+				return;
+			}
+			debouncedRefetch();
+		});
+		const offStatusChange = socket.on('status_change', () => {
+			debouncedRefetch();
+		});
+
+		socket.connect();
+
+		onCleanup(() => {
+			offLog();
+			offStatus();
+			offStatusChange();
+			socket.disconnect();
+		});
+	});
+
+	createEffect(() => {
+		const r = run();
+		if (!r || !isActiveRunStatus(r.status)) return;
+
+		const interval = window.setInterval(() => {
+			refetch();
+		}, 2500);
+
+		onCleanup(() => {
+			window.clearInterval(interval);
+		});
 	});
 
 	onCleanup(() => {
-		if (logSocket) {
-			logSocket.disconnect();
-			logSocket = null;
-		}
 		if (statusChangeTimer) {
 			clearTimeout(statusChangeTimer);
 			statusChangeTimer = null;
@@ -366,17 +415,8 @@ const RunDetailPage: Component = () => {
 		if (!stepId) return [];
 
 		const live = liveLogLines();
-		const historical = allLogs();
-
-		// Pick whichever source has data — prefer historical (authoritative),
-		// fall back to live lines during active streaming before first refetch.
-		const source = historical.length > 0
-			? historical.map(l => ({
-				content: l.content,
-				stream: l.stream || 'stdout',
-				step_run_id: l.step_run_id ?? '',
-			}))
-			: live;
+		const historical = allLogs().map(toLogEntry);
+		const source = mergeHistoricalAndLiveLogs(historical, live);
 
 		if (stepId === '__all__') {
 			return source;

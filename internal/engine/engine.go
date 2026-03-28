@@ -308,9 +308,121 @@ func (e *Engine) buildPipelineConfig(ctx context.Context, p *models.Pipeline, tr
 	}
 
 	config := specToSchedulerConfig(spec)
+	applyAutogenCompatibilityFixes(spec.Name, &config)
 	e.injectProjectEnv(ctx, p, &config)
 	e.injectRepoEnv(ctx, p, triggerData, &config)
 	return config
+}
+
+func applyAutogenCompatibilityFixes(pipelineName string, config *scheduler.PipelineConfig) {
+	if config == nil || pipelineName != "Node.js CI" {
+		return
+	}
+
+	for i := range config.Stages {
+		for j := range config.Stages[i].Jobs {
+			for k := range config.Stages[i].Jobs[j].Steps {
+				step := &config.Stages[i].Jobs[j].Steps[k]
+				switch step.Name {
+				case "Run linter":
+					if upgraded, ok := upgradeLegacyNodeLintCommand(step.Command); ok {
+						step.Command = upgraded
+					}
+				case "Run tests":
+					if upgraded, ok := upgradeLegacyNodeTestCommand(step.Command); ok {
+						step.Command = upgraded
+					}
+				}
+			}
+		}
+	}
+}
+
+func upgradeLegacyNodeLintCommand(command string) (string, bool) {
+	workDir := ""
+	baseCommand := strings.TrimSpace(command)
+
+	if strings.HasPrefix(baseCommand, "cd ") {
+		parts := strings.SplitN(baseCommand, "&&", 2)
+		if len(parts) == 2 {
+			workDir = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[0]), "cd "))
+			baseCommand = strings.TrimSpace(parts[1])
+		}
+	}
+
+	switch strings.Join(strings.Fields(baseCommand), " ") {
+	case "npm run lint", "yarn lint", "corepack enable && pnpm lint":
+		return legacyNodeLintCompatibilityCommand(workDir, baseCommand), true
+	default:
+		return "", false
+	}
+}
+
+func legacyNodeLintCompatibilityCommand(workDir, lintCommand string) string {
+	lines := make([]string, 0, 11)
+	if workDir != "" {
+		lines = append(lines, fmt.Sprintf("cd %s", workDir))
+	}
+	lines = append(lines,
+		`if [ ! -f package.json ]; then`,
+		`  echo "No package.json found, skipping lint"`,
+		`  exit 0`,
+		`fi`,
+		`if ! node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); process.exit(pkg.scripts && pkg.scripts.lint ? 0 : 1)' >/dev/null 2>&1; then`,
+		`  echo "No lint script found, skipping lint"`,
+		`  exit 0`,
+		`fi`,
+		lintCommand,
+	)
+	return strings.Join(lines, "\n")
+}
+
+func upgradeLegacyNodeTestCommand(command string) (string, bool) {
+	workDir := ""
+	baseCommand := strings.TrimSpace(command)
+
+	if strings.HasPrefix(baseCommand, "cd ") {
+		parts := strings.SplitN(baseCommand, "&&", 2)
+		if len(parts) == 2 {
+			workDir = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[0]), "cd "))
+			baseCommand = strings.TrimSpace(parts[1])
+		}
+	}
+
+	switch strings.Join(strings.Fields(baseCommand), " ") {
+	case "npm test", "yarn test", "corepack enable && pnpm test":
+		return legacyNodeTestCompatibilityCommand(workDir, baseCommand), true
+	default:
+		return "", false
+	}
+}
+
+func legacyNodeTestCompatibilityCommand(workDir, testCommand string) string {
+	lines := make([]string, 0, 16)
+	if workDir != "" {
+		lines = append(lines, fmt.Sprintf("cd %s", workDir))
+	}
+	lines = append(lines,
+		`if [ ! -f package.json ]; then`,
+		`  echo "No package.json found, skipping tests"`,
+		`  exit 0`,
+		`fi`,
+		`TEST_SCRIPT=$(node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); process.stdout.write((((pkg.scripts && pkg.scripts.test) || "").toLowerCase()))')`,
+		`if [ -z "$TEST_SCRIPT" ]; then`,
+		`  echo "No test script found, skipping tests"`,
+		`  exit 0`,
+		`fi`,
+		`export CI=true`,
+		`case "$TEST_SCRIPT" in`,
+		`  *react-scripts\ test*|*craco\ test*) `+testCommand+` -- --watch=false --passWithNoTests ;;`,
+		`  *vitest\ run*) `+testCommand+` ;;`,
+		`  *jest*--watchall=false*|*jest*--watch=false*) `+testCommand+` ;;`,
+		`  *jest*) `+testCommand+` -- --watchAll=false --passWithNoTests ;;`,
+		`  *vitest*) `+testCommand+` -- --run ;;`,
+		`  *) `+testCommand+` ;;`,
+		`esac`,
+	)
+	return strings.Join(lines, "\n")
 }
 
 // injectProjectEnv fetches project-level environment variables and secrets,

@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/oarkflow/deploy/backend/internal/detector"
 	"github.com/oarkflow/deploy/backend/internal/integrations"
@@ -32,12 +31,14 @@ type ImportRequest struct {
 
 // ImportResult holds the outcome of an import detection.
 type ImportResult struct {
-	WorkDir        string                    `json:"work_dir"`
+	WorkDir        string                     `json:"work_dir"`
 	Detections     []detector.DetectionResult `json:"detections"`
-	GeneratedYAML  string                    `json:"generated_pipeline"`
-	DefaultBranch  string                    `json:"default_branch"`
-	CloneURL       string                    `json:"clone_url"`
-	SecretFindings []secrets.ScanFinding     `json:"secret_findings,omitempty"`
+	Profile        detector.ProjectProfile    `json:"profile"`
+	Repository     RepositoryMetadata         `json:"repository"`
+	GeneratedYAML  string                     `json:"generated_pipeline"`
+	DefaultBranch  string                     `json:"default_branch"`
+	CloneURL       string                     `json:"clone_url"`
+	SecretFindings []secrets.ScanFinding      `json:"secret_findings,omitempty"`
 }
 
 // Service orchestrates project import: resolve source -> detect -> generate pipeline.
@@ -64,6 +65,7 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 	var workDir string
 	var cloneURL string
 	var defaultBranch string
+	repoMeta := RepositoryMetadata{Provider: "git"}
 	var err error
 
 	switch req.SourceType {
@@ -72,7 +74,12 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		if err != nil {
 			return nil, fmt.Errorf("create temp dir: %w", err)
 		}
-		err = CloneRepo(ctx, req.GitURL, req.Branch, workDir, CloneOptions{SSHKeyPEM: req.SSHKeyPEM})
+		repoMeta = normalizeRepositoryMetadata(req.GitURL, req.Branch, "")
+		authCloneURL := req.GitURL
+		if req.AccessToken != "" {
+			authCloneURL = injectTokenIntoCloneURL(req.GitURL, req.AccessToken, repoMeta.Provider)
+		}
+		err = CloneRepo(ctx, authCloneURL, req.Branch, workDir, CloneOptions{SSHKeyPEM: req.SSHKeyPEM})
 		if err != nil {
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("clone: %w", err)
@@ -82,6 +89,8 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		if defaultBranch == "" {
 			defaultBranch = "main"
 		}
+		repoMeta.CloneURL = cloneURL
+		repoMeta.DefaultBranch = defaultBranch
 
 	case "github", "gitlab", "bitbucket":
 		provider := s.newProvider(req.SourceType, req.AccessToken)
@@ -94,6 +103,13 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		}
 		cloneURL = info.CloneURL
 		defaultBranch = info.DefaultBranch
+		repoMeta = RepositoryMetadata{
+			Provider:      req.SourceType,
+			FullName:      info.FullName,
+			CloneURL:      info.CloneURL,
+			SSHURL:        info.SSHURL,
+			DefaultBranch: info.DefaultBranch,
+		}
 
 		workDir, err = os.MkdirTemp("", "flowforge-import-*")
 		if err != nil {
@@ -101,7 +117,7 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		}
 
 		// Inject token into HTTPS clone URL for authenticated clone.
-		authCloneURL := injectTokenInURL(cloneURL, req.AccessToken)
+		authCloneURL := injectTokenIntoCloneURL(cloneURL, req.AccessToken, req.SourceType)
 		branch := req.Branch
 		if branch == "" {
 			branch = defaultBranch
@@ -121,6 +137,12 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		}
 		workDir = req.LocalPath
 		cloneURL = req.LocalPath
+		repoMeta = RepositoryMetadata{
+			Provider:      "local",
+			FullName:      filepath.Base(req.LocalPath),
+			CloneURL:      req.LocalPath,
+			DefaultBranch: req.Branch,
+		}
 
 	case "upload":
 		if req.UploadPath == "" {
@@ -131,6 +153,10 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		// was added (e.g. pre-existing sessions).
 		workDir = UnwrapSingleSubfolder(req.UploadPath)
 		cloneURL = ""
+		repoMeta = RepositoryMetadata{
+			Provider: "upload",
+			FullName: filepath.Base(workDir),
+		}
 
 	default:
 		return nil, fmt.Errorf("unsupported source type: %s", req.SourceType)
@@ -138,10 +164,11 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 
 	// Run detection.
 	log.Printf("[importer] running detection on workDir=%s", workDir)
-	detections, err := detector.Detect(workDir)
+	inspection, err := detector.Inspect(workDir)
 	if err != nil {
 		return nil, fmt.Errorf("detect: %w", err)
 	}
+	detections := inspection.Detections
 	log.Printf("[importer] detection found %d results", len(detections))
 
 	// If the project already contains a flowforge.yml / .flowforge.yml, use
@@ -156,7 +183,7 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		}
 	}
 	if generatedYAML == "" {
-		generatedYAML = detector.GenerateStarterPipeline(detections)
+		generatedYAML = detector.GenerateStarterPipelineForProfile(detections, &inspection.Profile)
 	}
 
 	// Run secret scanning on the imported repo.
@@ -166,6 +193,8 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 	return &ImportResult{
 		WorkDir:        workDir,
 		Detections:     detections,
+		Profile:        inspection.Profile,
+		Repository:     repoMeta,
 		GeneratedYAML:  generatedYAML,
 		DefaultBranch:  defaultBranch,
 		CloneURL:       cloneURL,
@@ -182,13 +211,6 @@ func (s *Service) ListProviderRepos(ctx context.Context, provider, token string,
 	return p.ListRepos(ctx, opts)
 }
 
-// Cleanup removes a temporary work directory.
-func (s *Service) Cleanup(workDir string) {
-	if workDir != "" && strings.Contains(workDir, "flowforge-import-") {
-		os.RemoveAll(workDir)
-	}
-}
-
 func (s *Service) newProvider(providerType, token string) integrations.SCMProvider {
 	switch providerType {
 	case "github":
@@ -200,16 +222,4 @@ func (s *Service) newProvider(providerType, token string) integrations.SCMProvid
 	default:
 		return nil
 	}
-}
-
-// injectTokenInURL adds an OAuth token to an HTTPS clone URL for authenticated cloning.
-func injectTokenInURL(cloneURL, token string) string {
-	if token == "" {
-		return cloneURL
-	}
-	// https://github.com/owner/repo.git -> https://oauth2:TOKEN@github.com/owner/repo.git
-	if strings.HasPrefix(cloneURL, "https://") {
-		return "https://oauth2:" + token + "@" + strings.TrimPrefix(cloneURL, "https://")
-	}
-	return cloneURL
 }

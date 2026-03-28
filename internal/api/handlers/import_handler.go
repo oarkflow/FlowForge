@@ -36,12 +36,14 @@ type importDetectRequest struct {
 
 type importDetectResponse struct {
 	SessionID         string                       `json:"session_id"`
-	Detections        []detector.DetectionResult    `json:"detections"`
-	GeneratedPipeline string                        `json:"generated_pipeline"`
-	DefaultBranch     string                        `json:"default_branch"`
-	CloneURL          string                        `json:"clone_url"`
-	ExtractedEnvVars  []pipeline.ExtractedVariable  `json:"extracted_env_vars"`
-	ExtractedSecrets  []pipeline.ExtractedVariable  `json:"extracted_secrets"`
+	Detections        []detector.DetectionResult   `json:"detections"`
+	Profile           detector.ProjectProfile      `json:"profile"`
+	Repository        importer.RepositoryMetadata  `json:"repository"`
+	GeneratedPipeline string                       `json:"generated_pipeline"`
+	DefaultBranch     string                       `json:"default_branch"`
+	CloneURL          string                       `json:"clone_url"`
+	ExtractedEnvVars  []pipeline.ExtractedVariable `json:"extracted_env_vars"`
+	ExtractedSecrets  []pipeline.ExtractedVariable `json:"extracted_secrets"`
 }
 
 func (h *Handler) ImportDetect(c fiber.Ctx) error {
@@ -112,6 +114,8 @@ func (h *Handler) ImportDetect(c fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(importDetectResponse{
 		SessionID:         sessionID,
 		Detections:        result.Detections,
+		Profile:           result.Profile,
+		Repository:        result.Repository,
 		GeneratedPipeline: result.GeneratedYAML,
 		DefaultBranch:     result.DefaultBranch,
 		CloneURL:          result.CloneURL,
@@ -273,8 +277,8 @@ type importProjectRequest struct {
 	Repository       importRepoData               `json:"repository"`
 	PipelineYAML     string                       `json:"pipeline_yaml"`
 	SetupWebhook     bool                         `json:"setup_webhook"`
-	ExtractedEnvVars []pipeline.ExtractedVariable  `json:"extracted_env_vars,omitempty"`
-	ExtractedSecrets []pipeline.ExtractedVariable  `json:"extracted_secrets,omitempty"`
+	ExtractedEnvVars []pipeline.ExtractedVariable `json:"extracted_env_vars,omitempty"`
+	ExtractedSecrets []pipeline.ExtractedVariable `json:"extracted_secrets,omitempty"`
 }
 
 type importProjectData struct {

@@ -2,6 +2,7 @@ package detector
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -9,6 +10,12 @@ import (
 // as a YAML string based on the detection results. It selects the primary
 // language (highest confidence) and generates an appropriate CI pipeline.
 func GenerateStarterPipeline(results []DetectionResult) string {
+	return GenerateStarterPipelineForProfile(results, nil)
+}
+
+// GenerateStarterPipelineForProfile produces a starter pipeline using both
+// flat detections and the richer project profile when available.
+func GenerateStarterPipelineForProfile(results []DetectionResult, profile *ProjectProfile) string {
 	if len(results) == 0 {
 		return generateGenericPipeline()
 	}
@@ -17,11 +24,11 @@ func GenerateStarterPipeline(results []DetectionResult) string {
 
 	switch primary.Language {
 	case "Go":
-		return generateGoPipeline(primary)
+		return generateGoPipeline(primary, profile)
 	case "Node.js":
-		return generateNodePipeline(primary)
+		return generateNodePipeline(primary, profile)
 	case "Python":
-		return generatePythonPipeline(primary)
+		return generatePythonPipeline(primary, profile)
 	case "Ruby":
 		return generateRubyPipeline(primary)
 	case "Java":
@@ -55,21 +62,162 @@ func GenerateStarterPipeline(results []DetectionResult) string {
 	}
 }
 
+func primaryServiceForLanguage(profile *ProjectProfile, language string) *ServiceProfile {
+	if profile == nil {
+		return nil
+	}
+	for i := range profile.Services {
+		if profile.Services[i].Language == language && profile.Services[i].Path == "." {
+			return &profile.Services[i]
+		}
+	}
+	for i := range profile.Services {
+		if profile.Services[i].Language == language {
+			return &profile.Services[i]
+		}
+	}
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func commandForService(service *ServiceProfile, command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" || service == nil || service.Path == "." || service.Path == "" {
+		return command
+	}
+	return fmt.Sprintf("cd %s && %s", service.Path, command)
+}
+
+func dockerStagesForProfile(profile *ProjectProfile, service *ServiceProfile, appName string) []stageTemplate {
+	target := dockerTargetForProfile(profile, service)
+	if target == nil {
+		return nil
+	}
+
+	buildCmd := fmt.Sprintf("docker build -t app:latest -t app:$(date +%%Y%%m%%d%%H%%M%%S) -f %s %s", target.Path, dockerBuildContext(target.Path))
+	return []stageTemplate{
+		{
+			Name: "package",
+			Jobs: []jobTemplate{
+				{
+					Name:       "docker-build",
+					Image:      "docker:26-cli",
+					Privileged: true,
+					Steps: []stepTemplate{
+						{Name: "Build Docker image", Run: buildCmd},
+					},
+				},
+			},
+		},
+		deployStage(appName),
+	}
+}
+
+func dockerTargetForProfile(profile *ProjectProfile, service *ServiceProfile) *DeploymentTarget {
+	if profile == nil {
+		return nil
+	}
+	for i := range profile.DeploymentTargets {
+		target := &profile.DeploymentTargets[i]
+		if target.Type != "docker" {
+			continue
+		}
+		if service != nil && service.Path != "." && service.Path != "" {
+			targetDir := filepath.ToSlash(filepath.Dir(target.Path))
+			if targetDir == "." || targetDir == service.Path || strings.HasPrefix(target.Path, service.Path+"/") {
+				return target
+			}
+			continue
+		}
+		return target
+	}
+	return nil
+}
+
+func dockerBuildContext(dockerfilePath string) string {
+	dir := filepath.ToSlash(filepath.Dir(dockerfilePath))
+	if dir == "." || dir == "" {
+		return "."
+	}
+	return dir
+}
+
 // ---------------------------------------------------------------------------
 // Language-specific pipeline generators
 // ---------------------------------------------------------------------------
 
-func generateGoPipeline(r DetectionResult) string {
+func generateGoPipeline(r DetectionResult, profile *ProjectProfile) string {
 	goVersion := r.RuntimeVersion
 	if goVersion == "" {
 		goVersion = "1.22"
 	}
 	image := fmt.Sprintf("golang:%s-alpine", goVersion)
+	service := primaryServiceForLanguage(profile, "Go")
+	installCmd := "go mod download"
+	lintCmd := "golangci-lint run ./..."
+	testCmd := "go test -race -coverprofile=coverage.out ./..."
+	buildCmd := "go build -ldflags=\"-w -s\" -o dist/app ./..."
+	if service != nil {
+		installCmd = firstNonEmpty(service.Commands.Install, installCmd)
+		lintCmd = firstNonEmpty(service.Commands.Lint, lintCmd)
+		testCmd = firstNonEmpty(service.Commands.Test, testCmd)
+		buildCmd = firstNonEmpty(service.Commands.Build, buildCmd)
+	}
+	installCmd = commandForService(service, installCmd)
+	lintCmd = commandForService(service, lintCmd)
+	testCmd = commandForService(service, testCmd)
+	buildCmd = commandForService(service, buildCmd)
 
 	framework := ""
 	if r.Framework != "" {
 		framework = fmt.Sprintf("  # Detected framework: %s\n", r.Framework)
 	}
+
+	stages := []stageTemplate{
+		{
+			Name: "test",
+			Jobs: []jobTemplate{
+				{
+					Name: "lint",
+					Steps: []stepTemplate{
+						{Name: "Install golangci-lint", Run: "go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"},
+						{Name: "Install dependencies", Run: installCmd},
+						{Name: "Run linter", Run: lintCmd},
+					},
+				},
+				{
+					Name: "test",
+					Steps: []stepTemplate{
+						{Name: "Install dependencies", Run: installCmd},
+						{Name: "Run tests", Run: testCmd},
+						{Name: "Upload coverage", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "coverage-report", "path": "coverage.out"}},
+					},
+				},
+			},
+		},
+		{
+			Name: "build",
+			Jobs: []jobTemplate{
+				{
+					Name: "build",
+					Steps: []stepTemplate{
+						{Name: "Install dependencies", Run: installCmd},
+						{Name: "Build binary", Run: buildCmd},
+						{Name: "Upload artifact", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "app-binary", "path": "dist/app"}},
+					},
+				},
+			},
+		},
+	}
+	stages = append(stages, dockerStagesForProfile(profile, service, "my-go-app")...)
 
 	return renderYAML(pipelineTemplate{
 		Name:    "Go CI",
@@ -80,80 +228,53 @@ func generateGoPipeline(r DetectionResult) string {
 		},
 		CacheKey:   `go-mod-{{ hash "go.sum" }}`,
 		CachePaths: []string{"/go/pkg/mod"},
-		Stages: []stageTemplate{
-			{
-				Name: "test",
-				Jobs: []jobTemplate{
-					{
-						Name: "lint",
-						Steps: []stepTemplate{
-							{Name: "Install golangci-lint", Run: "go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"},
-							{Name: "Run linter", Run: "golangci-lint run ./..."},
-						},
-					},
-					{
-						Name: "test",
-						Steps: []stepTemplate{
-							{Name: "Run tests", Run: "go test -race -coverprofile=coverage.out ./..."},
-							{Name: "Upload coverage", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "coverage-report", "path": "coverage.out"}},
-						},
-					},
-				},
-			},
-			{
-				Name: "build",
-				Jobs: []jobTemplate{
-					{
-						Name: "build",
-						Steps: []stepTemplate{
-							{Name: "Build binary", Run: "go build -ldflags=\"-w -s\" -o dist/app ./..."},
-							{Name: "Upload artifact", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "app-binary", "path": "dist/app"}},
-						},
-					},
-				},
-			},
-			{
-				Name: "package",
-				Jobs: []jobTemplate{
-					{
-						Name:       "docker-build",
-						Image:      "docker:26-cli",
-						Privileged: true,
-						Steps: []stepTemplate{
-							{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
-						},
-					},
-				},
-			},
-			deployStage("my-go-app"),
-		},
+		Stages:     stages,
 	})
 }
 
-func generateNodePipeline(r DetectionResult) string {
+func generateNodePipeline(r DetectionResult, profile *ProjectProfile) string {
 	nodeVersion := r.RuntimeVersion
 	if nodeVersion == "" {
 		nodeVersion = "20"
 	}
 	image := fmt.Sprintf("node:%s-alpine", nodeVersion)
+	service := primaryServiceForLanguage(profile, "Node.js")
 
 	installCmd := "npm install"
-	testCmd := "npm test"
-	buildCmd := "npm run build"
-	lintCmd := "npm run lint"
+	testCmd := ""
+	buildCmd := ""
+	lintCmd := ""
 
-	switch r.BuildTool {
-	case "pnpm":
-		installCmd = "corepack enable && pnpm install"
-		testCmd = "corepack enable && pnpm test"
-		buildCmd = "corepack enable && pnpm build"
-		lintCmd = "corepack enable && pnpm lint"
-	case "yarn":
-		installCmd = "yarn install"
-		testCmd = "yarn test"
-		buildCmd = "yarn build"
-		lintCmd = "yarn lint"
+	if service == nil {
+		testCmd = "npm test"
+		buildCmd = "npm run build"
+		lintCmd = "npm run lint"
+		switch r.BuildTool {
+		case "pnpm":
+			installCmd = "corepack enable && pnpm install"
+			testCmd = "corepack enable && pnpm test"
+			buildCmd = "corepack enable && pnpm build"
+			lintCmd = "corepack enable && pnpm lint"
+		case "yarn":
+			installCmd = "yarn install"
+			testCmd = "yarn test"
+			buildCmd = "yarn build"
+			lintCmd = "yarn lint"
+		}
 	}
+	if service != nil {
+		installCmd = firstNonEmpty(service.Commands.Install, installCmd)
+		testCmd = service.Commands.Test
+		buildCmd = service.Commands.Build
+		lintCmd = service.Commands.Lint
+		if service.BuildTool != "" {
+			r.BuildTool = service.BuildTool
+		}
+	}
+	installCmd = commandForService(service, installCmd)
+	testCmd = commandForService(service, testCmd)
+	buildCmd = commandForService(service, buildCmd)
+	lintCmd = commandForService(service, lintCmd)
 
 	cacheKey := `node-modules-{{ hash "package-lock.json" }}`
 	if r.BuildTool == "pnpm" {
@@ -167,89 +288,118 @@ func generateNodePipeline(r DetectionResult) string {
 		framework = fmt.Sprintf("  # Detected framework: %s\n", r.Framework)
 	}
 
+	stages := []stageTemplate{
+		{
+			Name: "install",
+			Jobs: []jobTemplate{
+				{
+					Name: "install",
+					Steps: []stepTemplate{
+						{Name: "Install dependencies", Run: installCmd},
+					},
+				},
+			},
+		},
+	}
+	testJobs := []jobTemplate{}
+	if lintCmd != "" {
+		testJobs = append(testJobs, jobTemplate{
+			Name: "lint",
+			Steps: []stepTemplate{
+				{Name: "Run linter", Run: lintCmd},
+			},
+		})
+	}
+	if testCmd != "" {
+		testJobs = append(testJobs, jobTemplate{
+			Name: "test",
+			Steps: []stepTemplate{
+				{Name: "Run tests", Run: testCmd},
+			},
+		})
+	}
+	if len(testJobs) > 0 {
+		stages = append(stages, stageTemplate{Name: "test", Jobs: testJobs})
+	}
+	if buildCmd != "" {
+		stages = append(stages, stageTemplate{
+			Name: "build",
+			Jobs: []jobTemplate{
+				{
+					Name: "build",
+					Steps: []stepTemplate{
+						{Name: "Build project", Run: buildCmd},
+					},
+				},
+			},
+		})
+	}
+	stages = append(stages, dockerStagesForProfile(profile, service, "my-node-app")...)
+
 	return renderYAML(pipelineTemplate{
 		Name:       "Node.js CI",
 		Comment:    framework,
 		Image:      image,
 		CacheKey:   cacheKey,
 		CachePaths: []string{"node_modules"},
-		Stages: []stageTemplate{
-			{
-				Name: "install",
-				Jobs: []jobTemplate{
-					{
-						Name: "install",
-						Steps: []stepTemplate{
-							{Name: "Install dependencies", Run: installCmd},
-						},
-					},
-				},
-			},
-			{
-				Name: "test",
-				Jobs: []jobTemplate{
-					{
-						Name: "lint",
-						Steps: []stepTemplate{
-							{Name: "Run linter", Run: lintCmd},
-						},
-					},
-					{
-						Name: "test",
-						Steps: []stepTemplate{
-							{Name: "Run tests", Run: testCmd},
-						},
-					},
-				},
-			},
-			{
-				Name: "build",
-				Jobs: []jobTemplate{
-					{
-						Name: "build",
-						Steps: []stepTemplate{
-							{Name: "Build project", Run: buildCmd},
-						},
-					},
-				},
-			},
-			{
-				Name: "package",
-				Jobs: []jobTemplate{
-					{
-						Name:       "docker-build",
-						Image:      "docker:26-cli",
-						Privileged: true,
-						Steps: []stepTemplate{
-							{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
-						},
-					},
-				},
-			},
-			deployStage("my-node-app"),
-		},
+		Stages:     stages,
 	})
 }
 
-func generatePythonPipeline(r DetectionResult) string {
+func generatePythonPipeline(r DetectionResult, profile *ProjectProfile) string {
 	pyVersion := r.RuntimeVersion
 	if pyVersion == "" {
 		pyVersion = "3.12"
 	}
 	image := fmt.Sprintf("python:%s-slim", pyVersion)
+	service := primaryServiceForLanguage(profile, "Python")
 
 	installCmd := "pip install -r requirements.txt"
+	lintCmd := "pip install ruff && ruff check ."
+	testCmd := "pip install pytest pytest-cov && pytest --cov=. --cov-report=xml"
 	switch r.BuildTool {
 	case "poetry":
 		installCmd = "pip install poetry && poetry install --no-interaction"
 	case "pipenv":
 		installCmd = "pip install pipenv && pipenv install --dev"
 	}
+	if service != nil {
+		installCmd = firstNonEmpty(service.Commands.Install, installCmd)
+		lintCmd = firstNonEmpty(service.Commands.Lint, lintCmd)
+		testCmd = firstNonEmpty(service.Commands.Test, testCmd)
+	}
+	installCmd = commandForService(service, installCmd)
+	lintCmd = commandForService(service, lintCmd)
+	testCmd = commandForService(service, testCmd)
 
 	framework := ""
 	if r.Framework != "" {
 		framework = fmt.Sprintf("  # Detected framework: %s\n", r.Framework)
 	}
+
+	stages := []stageTemplate{
+		{
+			Name: "test",
+			Jobs: []jobTemplate{
+				{
+					Name: "lint",
+					Steps: []stepTemplate{
+						{Name: "Install dependencies", Run: installCmd},
+						{Name: "Run linter", Run: lintCmd},
+					},
+				},
+				{
+					Name: "test",
+					Steps: []stepTemplate{
+						{Name: "Install dependencies", Run: installCmd},
+						{Name: "Run tests", Run: testCmd},
+						{Name: "Upload coverage", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "coverage-report", "path": "coverage.xml"}},
+					},
+				},
+			},
+		},
+	}
+	stages = append(stages, dockerStagesForProfile(profile, service, "my-python-app")...)
 
 	return renderYAML(pipelineTemplate{
 		Name:       "Python CI",
@@ -257,28 +407,7 @@ func generatePythonPipeline(r DetectionResult) string {
 		Image:      image,
 		CacheKey:   `pip-cache-{{ hash "requirements.txt" }}`,
 		CachePaths: []string{"/root/.cache/pip"},
-		Stages: []stageTemplate{
-			{
-				Name: "test",
-				Jobs: []jobTemplate{
-					{
-						Name: "lint",
-						Steps: []stepTemplate{
-							{Name: "Install dependencies", Run: installCmd},
-							{Name: "Run linter", Run: "pip install ruff && ruff check ."},
-						},
-					},
-					{
-						Name: "test",
-						Steps: []stepTemplate{
-							{Name: "Install dependencies", Run: installCmd},
-							{Name: "Run tests", Run: "pip install pytest pytest-cov && pytest --cov=. --cov-report=xml"},
-							{Name: "Upload coverage", Uses: "flowforge/upload-artifact@v1", With: map[string]string{"name": "coverage-report", "path": "coverage.xml"}},
-						},
-					},
-				},
-			},
-		},
+		Stages:     stages,
 	})
 }
 
@@ -992,12 +1121,12 @@ type stageTemplate struct {
 }
 
 type jobTemplate struct {
-	Name         string
-	Image        string   // per-job image override (empty = use pipeline default)
-	CacheKey     string   // per-job cache key override
-	CachePaths   []string // per-job cache paths override
-	Privileged   bool     // mount Docker socket + privileged mode
-	Steps        []stepTemplate
+	Name       string
+	Image      string   // per-job image override (empty = use pipeline default)
+	CacheKey   string   // per-job cache key override
+	CachePaths []string // per-job cache paths override
+	Privileged bool     // mount Docker socket + privileged mode
+	Steps      []stepTemplate
 }
 
 type stepTemplate struct {

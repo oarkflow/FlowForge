@@ -382,6 +382,57 @@ export interface DetectionResult {
 	runtime_version: string;
 }
 
+export interface CommandHints {
+	install?: string;
+	lint?: string;
+	test?: string;
+	build?: string;
+	run?: string;
+}
+
+export interface ImportServiceProfile {
+	name: string;
+	path: string;
+	language?: string;
+	framework?: string;
+	package_manager?: string;
+	build_tool?: string;
+	runtime_version?: string;
+	dependency_files?: string[];
+	dependencies?: string[];
+	config_files?: string[];
+	commands?: CommandHints;
+}
+
+export interface ImportDeploymentTarget {
+	type: string;
+	path: string;
+	tool?: string;
+}
+
+export interface ImportProjectProfile {
+	has_flowforge_config: boolean;
+	flowforge_config_path?: string;
+	monorepo: boolean;
+	primary_language?: string;
+	primary_framework?: string;
+	package_managers?: string[];
+	dependency_files?: string[];
+	config_files?: string[];
+	env_files?: string[];
+	commands?: CommandHints;
+	services?: ImportServiceProfile[];
+	deployment_targets?: ImportDeploymentTarget[];
+}
+
+export interface ImportRepositoryMetadata {
+	provider: string;
+	full_name?: string;
+	clone_url?: string;
+	ssh_url?: string;
+	default_branch?: string;
+}
+
 export interface ImportDetectRequest {
 	source_type: string;
 	git_url?: string;
@@ -397,6 +448,8 @@ export interface ImportDetectRequest {
 export interface ImportDetectResponse {
 	session_id: string;
 	detections: DetectionResult[];
+	profile: ImportProjectProfile;
+	repository: ImportRepositoryMetadata;
 	generated_pipeline: string;
 	default_branch: string;
 	clone_url: string;
