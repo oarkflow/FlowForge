@@ -49,7 +49,7 @@ RUN chown -R flowforge:flowforge /app
 
 EXPOSE 9090
 
-ENV SERVER_URL=http://flowforge-server:8081
+ENV SERVER_URL=http://flowforge-server:8082
 ENV AGENT_NAME=agent-1
 ENV EXECUTOR_TYPE=docker
 ENV LOG_LEVEL=info

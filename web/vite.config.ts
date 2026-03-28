@@ -7,15 +7,15 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/api': 'http://localhost:8081',
+      '/api': 'http://localhost:8082',
       '/ws': {
-        target: 'ws://localhost:8081',
+        target: 'ws://localhost:8082',
         ws: true,
       },
       '/sse': {
-        target: 'http://localhost:8081',
+        target: 'http://localhost:8082',
       },
-      '/webhooks': 'http://localhost:8081',
+      '/webhooks': 'http://localhost:8082',
     },
   },
 });

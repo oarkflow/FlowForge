@@ -87,7 +87,7 @@ type Config struct {
 func Load() *Config {
 	v := viper.New()
 
-	v.SetDefault("port", "8081")
+	v.SetDefault("port", "8082")
 	v.SetDefault("database_path", "data/flowforge.db")
 	v.SetDefault("jwt_secret", "change-me-in-production")
 	v.SetDefault("jwt_expiration", 15*time.Minute)

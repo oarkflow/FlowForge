@@ -99,7 +99,7 @@ flowforge-agent \
 
 | CLI Flag       | Environment Variable            | Default                  | Description                          |
 |---------------|--------------------------------|--------------------------|--------------------------------------|
-| `--server`    | `FLOWFORGE_SERVER_URL`          | `http://localhost:8081`  | FlowForge server URL                |
+| `--server`    | `FLOWFORGE_SERVER_URL`          | `http://localhost:8082`  | FlowForge server URL                |
 | `--token`     | `FLOWFORGE_AGENT_TOKEN`         | *(required)*             | Agent authentication token           |
 | `--name`      | `FLOWFORGE_AGENT_NAME`          | Machine hostname         | Agent display name                   |
 | `--executor`  | `FLOWFORGE_AGENT_EXECUTOR`      | `local`                  | Executor type                        |

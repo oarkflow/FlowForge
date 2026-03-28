@@ -15,14 +15,14 @@ services:
     container_name: flowforge-backend-dev
     working_dir: /app
     ports:
-      - "8081:8081"
+      - "8082:8082"
     volumes:
       - ./backend:/app
       - ./data:/data
       - go-cache:/root/go/pkg/mod
     environment:
       - DATABASE_PATH=/data/flowforge.db
-      - PORT=8081
+      - PORT=8082
       - JWT_SECRET=dev-secret-change-in-prod
       - ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
       - ALLOWED_ORIGINS=http://localhost:3000
@@ -54,7 +54,7 @@ services:
       - ./frontend:/app
       - node-modules:/app/node_modules
     environment:
-      - VITE_API_URL=http://localhost:8081
+      - VITE_API_URL=http://localhost:8082
     command: >
       sh -c "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:

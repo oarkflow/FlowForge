@@ -36,13 +36,13 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 8081
+              containerPort: 8082
               protocol: TCP
           env:
             - name: DATABASE_PATH
               value: /data/flowforge.db
             - name: PORT
-              value: "8081"
+              value: "8082"
             - name: LOG_LEVEL
               value: info
             - name: ALLOWED_ORIGINS
