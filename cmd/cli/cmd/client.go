@@ -42,7 +42,7 @@ func initConfig() {
 		serverURL = viper.GetString("server_url")
 	}
 	if serverURL == "" {
-		serverURL = "http://localhost:8081"
+		serverURL = "http://localhost:8082"
 	}
 
 	if apiToken == "" {

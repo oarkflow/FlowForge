@@ -11,8 +11,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg == nil {
 		t.Fatal("Load() should return non-nil config")
 	}
-	if cfg.Port != "8081" {
-		t.Errorf("Port = %q, want %q", cfg.Port, "8081")
+	if cfg.Port != "8082" {
+		t.Errorf("Port = %q, want %q", cfg.Port, "8082")
 	}
 	if cfg.DatabasePath != "data/flowforge.db" {
 		t.Errorf("DatabasePath = %q, want %q", cfg.DatabasePath, "data/flowforge.db")

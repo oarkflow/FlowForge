@@ -100,7 +100,7 @@ Commands:
   version     Print version information
 
 Global Flags:
-  --server    FlowForge server URL (default: http://localhost:8081)
+  --server    FlowForge server URL (default: http://localhost:8082)
   --token     API authentication token
   --output    Output format: table, json (default: table)
   --config    Config file path (default: ~/.flowforge/config.yaml)

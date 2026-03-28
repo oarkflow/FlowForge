@@ -91,7 +91,7 @@ func main() {
 func parseFlags() agentConfig {
 	cfg := agentConfig{}
 
-	flag.StringVar(&cfg.ServerURL, "server", envOrDefault("FLOWFORGE_SERVER_URL", "http://localhost:8081"), "FlowForge server URL (HTTP mode)")
+	flag.StringVar(&cfg.ServerURL, "server", envOrDefault("FLOWFORGE_SERVER_URL", "http://localhost:8082"), "FlowForge server URL (HTTP mode)")
 	flag.StringVar(&cfg.GRPCAddr, "grpc-addr", envOrDefault("FLOWFORGE_GRPC_ADDR", "localhost:9090"), "gRPC server address (host:port)")
 	flag.BoolVar(&cfg.UseGRPC, "grpc", envOrDefault("FLOWFORGE_USE_GRPC", "false") == "true", "Use gRPC transport instead of HTTP")
 	flag.StringVar(&cfg.Token, "token", envOrDefault("FLOWFORGE_AGENT_TOKEN", ""), "Agent authentication token")
