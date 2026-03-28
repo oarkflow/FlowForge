@@ -38,6 +38,18 @@ func GenerateStarterPipeline(results []DetectionResult) string {
 		return generateSwiftPipeline(primary)
 	case "Scala":
 		return generateScalaPipeline(results, primary)
+	case "Docker":
+		return generateDockerPipeline(primary)
+	case "Docker Compose":
+		return generateDockerComposePipeline(primary)
+	case "Kubernetes":
+		return generateKubernetesPipeline(primary)
+	case "Terraform":
+		return generateTerraformPipeline(primary)
+	case "Nginx":
+		return generateNginxPipeline(primary)
+	case "Systemd":
+		return generateSystemdPipeline(primary)
 	default:
 		return generateGenericPipeline()
 	}
@@ -684,6 +696,202 @@ func generateScalaPipeline(results []DetectionResult, r DetectionResult) string 
 		Comment: framework,
 		Image:   jdkImage,
 		Stages:  stages,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Infrastructure pipeline generators
+// ---------------------------------------------------------------------------
+
+func generateDockerPipeline(r DetectionResult) string {
+	return renderYAML(pipelineTemplate{
+		Name:  "Docker CI/CD",
+		Image: "docker:26-cli",
+		Stages: []stageTemplate{
+			{
+				Name: "build",
+				Jobs: []jobTemplate{
+					{
+						Name:       "docker-build",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Build Docker image", Run: "docker build -t app:latest -t app:$(date +%Y%m%d%H%M%S) ."},
+							{Name: "List images", Run: "docker images | head -20"},
+						},
+					},
+				},
+			},
+			deployStage("my-docker-app"),
+		},
+	})
+}
+
+func generateDockerComposePipeline(r DetectionResult) string {
+	return renderYAML(pipelineTemplate{
+		Name:  "Docker Compose CI/CD",
+		Image: "docker:26-cli",
+		Stages: []stageTemplate{
+			{
+				Name: "validate",
+				Jobs: []jobTemplate{
+					{
+						Name:       "validate",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Validate compose file", Run: "docker compose config --quiet"},
+						},
+					},
+				},
+			},
+			{
+				Name: "deploy",
+				Jobs: []jobTemplate{
+					{
+						Name:       "deploy",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Pull images", Run: "docker compose pull"},
+							{Name: "Deploy services", Run: "docker compose up -d --build --remove-orphans"},
+							{Name: "Show status", Run: "docker compose ps"},
+						},
+					},
+				},
+			},
+		},
+	})
+}
+
+func generateKubernetesPipeline(r DetectionResult) string {
+	return renderYAML(pipelineTemplate{
+		Name:  "Kubernetes Deploy",
+		Image: "bitnami/kubectl:latest",
+		Stages: []stageTemplate{
+			{
+				Name: "validate",
+				Jobs: []jobTemplate{
+					{
+						Name: "validate",
+						Steps: []stepTemplate{
+							{Name: "Validate manifests", Run: "kubectl apply --dry-run=client -f ."},
+						},
+					},
+				},
+			},
+			{
+				Name: "deploy",
+				Jobs: []jobTemplate{
+					{
+						Name: "deploy",
+						Steps: []stepTemplate{
+							{Name: "Apply manifests", Run: "kubectl apply -f ."},
+							{Name: "Check rollout status", Run: "kubectl rollout status deployment --timeout=120s || true"},
+						},
+					},
+				},
+			},
+		},
+	})
+}
+
+func generateTerraformPipeline(r DetectionResult) string {
+	return renderYAML(pipelineTemplate{
+		Name:  "Terraform CI/CD",
+		Image: "hashicorp/terraform:latest",
+		Stages: []stageTemplate{
+			{
+				Name: "validate",
+				Jobs: []jobTemplate{
+					{
+						Name: "validate",
+						Steps: []stepTemplate{
+							{Name: "Init", Run: "terraform init -backend=false"},
+							{Name: "Format check", Run: "terraform fmt -check -recursive"},
+							{Name: "Validate", Run: "terraform validate"},
+						},
+					},
+				},
+			},
+			{
+				Name: "plan",
+				Jobs: []jobTemplate{
+					{
+						Name: "plan",
+						Steps: []stepTemplate{
+							{Name: "Init", Run: "terraform init"},
+							{Name: "Plan", Run: "terraform plan -out=tfplan"},
+						},
+					},
+				},
+			},
+		},
+	})
+}
+
+func generateNginxPipeline(r DetectionResult) string {
+	return renderYAML(pipelineTemplate{
+		Name:  "Nginx Deploy",
+		Image: "nginx:alpine",
+		Stages: []stageTemplate{
+			{
+				Name: "validate",
+				Jobs: []jobTemplate{
+					{
+						Name: "validate",
+						Steps: []stepTemplate{
+							{Name: "Test config", Run: "nginx -t -c /etc/nginx/nginx.conf || echo 'Using project config' && ls -la *.conf nginx/ 2>/dev/null || true"},
+						},
+					},
+				},
+			},
+			{
+				Name: "deploy",
+				Jobs: []jobTemplate{
+					{
+						Name:       "deploy",
+						Image:      "docker:26-cli",
+						Privileged: true,
+						Steps: []stepTemplate{
+							{Name: "Deploy Nginx", Run: "docker build -t nginx-app:latest . && docker stop nginx-app 2>/dev/null || true && docker rm nginx-app 2>/dev/null || true && docker run -d --name nginx-app --restart unless-stopped -p 80:80 nginx-app:latest"},
+						},
+					},
+				},
+			},
+		},
+	})
+}
+
+func generateSystemdPipeline(r DetectionResult) string {
+	return renderYAML(pipelineTemplate{
+		Name:  "Systemd Service Deploy",
+		Image: "ubuntu:22.04",
+		Stages: []stageTemplate{
+			{
+				Name: "validate",
+				Jobs: []jobTemplate{
+					{
+						Name: "validate",
+						Steps: []stepTemplate{
+							{Name: "List service files", Run: "find . -name '*.service' -o -name '*.timer' | head -20"},
+							{Name: "Show service config", Run: "cat *.service 2>/dev/null || find . -name '*.service' -exec cat {} \\;"},
+						},
+					},
+				},
+			},
+			{
+				Name: "deploy",
+				Jobs: []jobTemplate{
+					{
+						Name: "deploy",
+						Steps: []stepTemplate{
+							{Name: "Copy service files", Run: "echo 'Copy .service files to /etc/systemd/system/ and run: systemctl daemon-reload && systemctl enable --now <service>'"},
+						},
+					},
+				},
+			},
+		},
 	})
 }
 

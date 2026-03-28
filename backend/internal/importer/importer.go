@@ -3,7 +3,9 @@ package importer
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/oarkflow/deploy/backend/internal/detector"
@@ -124,7 +126,10 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		if req.UploadPath == "" {
 			return nil, fmt.Errorf("upload path is required")
 		}
-		workDir = req.UploadPath
+		// The upload handler already calls UnwrapSingleSubfolder, but apply
+		// it here too in case the path was stored before the unwrap logic
+		// was added (e.g. pre-existing sessions).
+		workDir = UnwrapSingleSubfolder(req.UploadPath)
 		cloneURL = ""
 
 	default:
@@ -132,13 +137,27 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 	}
 
 	// Run detection.
+	log.Printf("[importer] running detection on workDir=%s", workDir)
 	detections, err := detector.Detect(workDir)
 	if err != nil {
 		return nil, fmt.Errorf("detect: %w", err)
 	}
+	log.Printf("[importer] detection found %d results", len(detections))
 
-	// Generate starter pipeline.
-	generatedYAML := detector.GenerateStarterPipeline(detections)
+	// If the project already contains a flowforge.yml / .flowforge.yml, use
+	// that as the pipeline config instead of auto-generating one.
+	generatedYAML := ""
+	for _, name := range []string{"flowforge.yml", ".flowforge.yml", "flowforge.yaml", ".flowforge.yaml"} {
+		candidate := filepath.Join(workDir, name)
+		if data, err := os.ReadFile(candidate); err == nil && len(data) > 0 {
+			generatedYAML = string(data)
+			log.Printf("[importer] found existing pipeline config: %s", name)
+			break
+		}
+	}
+	if generatedYAML == "" {
+		generatedYAML = detector.GenerateStarterPipeline(detections)
+	}
 
 	// Run secret scanning on the imported repo.
 	scanner := secrets.NewScanner()

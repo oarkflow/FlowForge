@@ -6,15 +6,18 @@ import { toast } from '../ui/Toast';
 import { api, ApiRequestError } from '../../api/client';
 import type {
   DetectionResult, ProviderRepo,
-  ImportCreateProjectRequest,
+  ImportCreateProjectRequest, ExtractedVariable,
 } from '../../types';
 
 import StepSourceType from './StepSourceType';
 import StepSourceDetails from './StepSourceDetails';
 import StepDetectionResults from './StepDetectionResults';
 import StepProjectCreate from './StepProjectCreate';
+import { extractPipelineVariables } from '../../utils/pipelineExtractor';
 
 export type SourceType = 'git' | 'github' | 'gitlab' | 'bitbucket' | 'local' | 'upload' | null;
+
+export type LocalMode = 'path' | 'file' | 'folder';
 
 export interface WizardState {
   step: 1 | 2 | 3 | 4;
@@ -24,6 +27,7 @@ export interface WizardState {
   sshKey: string;
   selectedRepo: ProviderRepo | null;
   localPath: string;
+  localMode: LocalMode;
   uploadId: string;
   uploadFilename: string;
   providerToken: string;
@@ -33,6 +37,8 @@ export interface WizardState {
   editedPipeline: string;
   defaultBranch: string;
   cloneUrl: string;
+  extractedEnvVars: ExtractedVariable[];
+  extractedSecrets: ExtractedVariable[];
   projectName: string;
   projectSlug: string;
   projectDescription: string;
@@ -51,6 +57,7 @@ const initialState: WizardState = {
   sshKey: '',
   selectedRepo: null,
   localPath: '',
+  localMode: 'path',
   uploadId: '',
   uploadFilename: '',
   providerToken: '',
@@ -60,6 +67,8 @@ const initialState: WizardState = {
   editedPipeline: '',
   defaultBranch: '',
   cloneUrl: '',
+  extractedEnvVars: [],
+  extractedSecrets: [],
   projectName: '',
   projectSlug: '',
   projectDescription: '',
@@ -113,7 +122,13 @@ const ImportWizard: Component = () => {
         detectReq.repo_owner = parts[0];
         detectReq.repo_name = parts.slice(1).join('/');
       } else if (state.sourceType === 'local') {
-        detectReq.local_path = state.localPath;
+        if (state.localMode === 'path') {
+          detectReq.local_path = state.localPath;
+        } else {
+          // 'file' or 'folder' mode — archive was uploaded, use upload flow
+          detectReq.source_type = 'upload';
+          detectReq.upload_id = state.uploadId;
+        }
       } else if (state.sourceType === 'upload') {
         detectReq.upload_id = state.uploadId;
       }
@@ -130,6 +145,8 @@ const ImportWizard: Component = () => {
         editedPipeline: result.generated_pipeline,
         defaultBranch: result.default_branch || state.defaultBranch,
         cloneUrl: result.clone_url || state.cloneUrl,
+        extractedEnvVars: result.extracted_env_vars ?? [],
+        extractedSecrets: result.extracted_secrets ?? [],
       });
 
       // Auto-populate project name from repo name.
@@ -160,6 +177,14 @@ const ImportWizard: Component = () => {
   };
 
   const proceedToCreate = () => {
+    // Re-extract variables if the user edited the pipeline YAML.
+    if (state.editedPipeline !== state.generatedPipeline) {
+      const extracted = extractPipelineVariables(state.editedPipeline);
+      setState({
+        extractedEnvVars: extracted.envVars,
+        extractedSecrets: extracted.secrets,
+      });
+    }
     setStep(4);
     setError('');
   };
@@ -190,6 +215,8 @@ const ImportWizard: Component = () => {
         },
         pipeline_yaml: state.editedPipeline,
         setup_webhook: state.setupWebhook,
+        extracted_env_vars: state.extractedEnvVars.filter(v => !v.has_value),
+        extracted_secrets: state.extractedSecrets,
       };
 
       const result = await api.import.createProject(
@@ -198,7 +225,20 @@ const ImportWizard: Component = () => {
       );
 
       toast.success(`Project "${result.project.name}" created successfully`);
-      navigate(`/projects/${result.project.id}`);
+
+      // Navigate to the project page with the right tab pre-selected based
+      // on what the pipeline needs to be configured.
+      const needsSecrets = state.extractedSecrets.length > 0;
+      const needsEnvVars = state.extractedEnvVars.filter(v => !v.has_value).length > 0;
+
+      let tab = '';
+      if (needsSecrets) {
+        tab = '?tab=secrets';
+      } else if (needsEnvVars) {
+        tab = '?tab=environment';
+      }
+
+      navigate(`/projects/${result.project.id}${tab}`);
     } catch (err) {
       const msg = err instanceof ApiRequestError ? err.message : 'Failed to create project';
       setError(msg);
@@ -273,6 +313,8 @@ const ImportWizard: Component = () => {
             generatedPipeline={state.generatedPipeline}
             editedPipeline={state.editedPipeline}
             onEditPipeline={(yaml) => setState('editedPipeline', yaml)}
+            extractedEnvVars={state.extractedEnvVars}
+            extractedSecrets={state.extractedSecrets}
             onNext={proceedToCreate}
             onBack={goBack}
           />

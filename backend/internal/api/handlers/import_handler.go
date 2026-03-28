@@ -14,6 +14,7 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/importer"
 	"github.com/oarkflow/deploy/backend/internal/integrations"
 	"github.com/oarkflow/deploy/backend/internal/models"
+	"github.com/oarkflow/deploy/backend/internal/pipeline"
 	"github.com/oarkflow/deploy/backend/pkg/crypto"
 )
 
@@ -34,11 +35,13 @@ type importDetectRequest struct {
 }
 
 type importDetectResponse struct {
-	SessionID         string                    `json:"session_id"`
-	Detections        []detector.DetectionResult `json:"detections"`
-	GeneratedPipeline string                    `json:"generated_pipeline"`
-	DefaultBranch     string                    `json:"default_branch"`
-	CloneURL          string                    `json:"clone_url"`
+	SessionID         string                       `json:"session_id"`
+	Detections        []detector.DetectionResult    `json:"detections"`
+	GeneratedPipeline string                        `json:"generated_pipeline"`
+	DefaultBranch     string                        `json:"default_branch"`
+	CloneURL          string                        `json:"clone_url"`
+	ExtractedEnvVars  []pipeline.ExtractedVariable  `json:"extracted_env_vars"`
+	ExtractedSecrets  []pipeline.ExtractedVariable  `json:"extracted_secrets"`
 }
 
 func (h *Handler) ImportDetect(c fiber.Ctx) error {
@@ -103,12 +106,17 @@ func (h *Handler) ImportDetect(c fiber.Ctx) error {
 	// Store the work dir in session for later use in project creation.
 	sessionID := h.importer.Sessions().Create(result.WorkDir)
 
+	// Extract env vars and secrets referenced in the pipeline YAML.
+	extraction := pipeline.ExtractVariables(result.GeneratedYAML)
+
 	return c.Status(fiber.StatusOK).JSON(importDetectResponse{
 		SessionID:         sessionID,
 		Detections:        result.Detections,
 		GeneratedPipeline: result.GeneratedYAML,
 		DefaultBranch:     result.DefaultBranch,
 		CloneURL:          result.CloneURL,
+		ExtractedEnvVars:  extraction.EnvVars,
+		ExtractedSecrets:  extraction.Secrets,
 	})
 }
 
@@ -177,6 +185,12 @@ func (h *Handler) ImportUpload(c fiber.Ctx) error {
 			"message": fmt.Sprintf("Failed to extract archive: %v", err),
 		})
 	}
+
+	// Unwrap single-subfolder archives: if the extraction produced a single
+	// directory entry inside extractDir (e.g. extracted/my-project/), use that
+	// inner directory as the working directory so the detector sees the project
+	// root directly rather than a wrapper folder.
+	extractDir = importer.UnwrapSingleSubfolder(extractDir)
 
 	// Store in session so /detect can find it.
 	uploadID := h.importer.Sessions().Create(extractDir)
@@ -254,11 +268,13 @@ func (h *Handler) ImportListRepos(c fiber.Ctx) error {
 // --------------------------------------------------------------------------
 
 type importProjectRequest struct {
-	SessionID    string                 `json:"session_id"`
-	Project      importProjectData      `json:"project"`
-	Repository   importRepoData         `json:"repository"`
-	PipelineYAML string                 `json:"pipeline_yaml"`
-	SetupWebhook bool                   `json:"setup_webhook"`
+	SessionID        string                       `json:"session_id"`
+	Project          importProjectData            `json:"project"`
+	Repository       importRepoData               `json:"repository"`
+	PipelineYAML     string                       `json:"pipeline_yaml"`
+	SetupWebhook     bool                         `json:"setup_webhook"`
+	ExtractedEnvVars []pipeline.ExtractedVariable  `json:"extracted_env_vars,omitempty"`
+	ExtractedSecrets []pipeline.ExtractedVariable  `json:"extracted_secrets,omitempty"`
 }
 
 type importProjectData struct {
@@ -443,6 +459,26 @@ func (h *Handler) ImportCreateProject(c fiber.Ctx) error {
 
 	// Audit log.
 	h.audit.LogAction(c.Context(), userID, getClientIP(c), "import_project", "project", projectID, nil)
+
+	// Auto-create extracted env vars with empty values so they appear
+	// in the project settings, ready for the user to fill in.
+	for _, ev := range req.ExtractedEnvVars {
+		if ev.HasValue {
+			continue
+		}
+		_ = h.repo.EnvVars.Create(c.Context(), &models.EnvVar{
+			ProjectID: projectID,
+			Key:       ev.Name,
+			Value:     "",
+		})
+	}
+
+	// Auto-create extracted secrets with a placeholder empty value.
+	// SecretStore.Create rejects empty strings, so we use the repo
+	// directly with an encrypted empty value.
+	for _, sec := range req.ExtractedSecrets {
+		_ = h.secretStore.CreateEmpty(c.Context(), projectID, sec.Name, userID)
+	}
 
 	// Fetch created resources for response.
 	var project models.Project

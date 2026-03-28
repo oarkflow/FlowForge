@@ -1,14 +1,16 @@
 import type { Component } from 'solid-js';
-import { For, Show } from 'solid-js';
+import { For, Show, createMemo } from 'solid-js';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
-import type { DetectionResult } from '../../types';
+import type { DetectionResult, ExtractedVariable } from '../../types';
 
 interface Props {
   detections: DetectionResult[];
   generatedPipeline: string;
   editedPipeline: string;
   onEditPipeline: (yaml: string) => void;
+  extractedEnvVars: ExtractedVariable[];
+  extractedSecrets: ExtractedVariable[];
   onNext: () => void;
   onBack: () => void;
 }
@@ -24,6 +26,14 @@ function confidenceLabel(c: number): string {
 }
 
 const StepDetectionResults: Component<Props> = (props) => {
+  const needsConfigEnvVars = createMemo(() =>
+    props.extractedEnvVars.filter(v => !v.has_value)
+  );
+
+  const hasRequiredConfig = createMemo(() =>
+    props.extractedSecrets.length > 0 || needsConfigEnvVars().length > 0
+  );
+
   return (
     <div>
       <h2 class="text-xl font-semibold text-[var(--color-text-primary)] mb-2">
@@ -92,6 +102,48 @@ const StepDetectionResults: Component<Props> = (props) => {
           spellcheck={false}
         />
       </div>
+
+      {/* Required Configuration */}
+      <Show when={hasRequiredConfig()}>
+        <div class="mb-6 p-4 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border-primary)]">
+          <h3 class="text-sm font-medium text-[var(--color-text-primary)] mb-3">
+            Required Configuration
+          </h3>
+          <p class="text-xs text-[var(--color-text-tertiary)] mb-3">
+            Your pipeline references variables and secrets that will need to be configured after project creation.
+          </p>
+
+          <Show when={props.extractedSecrets.length > 0}>
+            <div class="mb-3">
+              <p class="text-xs font-medium text-amber-400 mb-2">
+                Secrets ({props.extractedSecrets.length})
+              </p>
+              <div class="flex flex-wrap gap-2">
+                <For each={props.extractedSecrets}>{(s) => (
+                  <span class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                    {s.name}
+                  </span>
+                )}</For>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={needsConfigEnvVars().length > 0}>
+            <div>
+              <p class="text-xs font-medium text-blue-400 mb-2">
+                Environment Variables ({needsConfigEnvVars().length})
+              </p>
+              <div class="flex flex-wrap gap-2">
+                <For each={needsConfigEnvVars()}>{(v) => (
+                  <span class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-mono bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                    {v.name}
+                  </span>
+                )}</For>
+              </div>
+            </div>
+          </Show>
+        </div>
+      </Show>
 
       <div class="flex justify-between">
         <Button variant="ghost" onClick={props.onBack}>Back</Button>

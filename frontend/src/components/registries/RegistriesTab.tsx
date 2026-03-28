@@ -1,6 +1,7 @@
 import { createSignal, createEffect, Show, For, onMount } from 'solid-js';
 import { api } from '../../api/client';
 import type { Registry, RegistryType, RegistryImage, RegistryTag } from '../../types';
+import ConfirmDialog from '../ui/ConfirmDialog';
 
 // ─── Registry type metadata ─────────────────────────────────────────────────
 const REGISTRY_TYPES: { value: RegistryType; label: string; icon: string }[] = [
@@ -136,6 +137,7 @@ export default function RegistriesTab(props: RegistriesTabProps) {
 	const [showCreateModal, setShowCreateModal] = createSignal(false);
 	const [editingRegistry, setEditingRegistry] = createSignal<Registry | null>(null);
 	const [browsingRegistry, setBrowsingRegistry] = createSignal<Registry | null>(null);
+	const [deletingRegistry, setDeletingRegistry] = createSignal<Registry | null>(null);
 
 	// Test result states
 	const [testResults, setTestResults] = createSignal<Record<string, { success: boolean; message: string }>>({});
@@ -177,13 +179,16 @@ export default function RegistriesTab(props: RegistriesTabProps) {
 	}
 
 	// ─── Delete registry ──────────────────────────────────────────────────────
-	async function deleteRegistry(reg: Registry) {
-		if (!confirm(`Delete registry "${reg.name}"? This cannot be undone.`)) return;
+	async function confirmDeleteRegistry() {
+		const reg = deletingRegistry();
+		if (!reg) return;
 		try {
 			await api.registries.delete(props.projectId, reg.id);
 			await loadRegistries();
 		} catch (err: any) {
 			setError(err.message || 'Failed to delete registry');
+		} finally {
+			setDeletingRegistry(null);
 		}
 	}
 
@@ -339,7 +344,7 @@ export default function RegistriesTab(props: RegistriesTabProps) {
 											</button>
 										</Show>
 										<button
-											onClick={() => deleteRegistry(reg)}
+											onClick={() => setDeletingRegistry(reg)}
 											class="px-3 py-1.5 text-xs bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded-lg transition-colors"
 										>
 											Delete
@@ -379,13 +384,23 @@ export default function RegistriesTab(props: RegistriesTabProps) {
 					onClose={() => setBrowsingRegistry(null)}
 				/>
 			</Show>
+
+			{/* Delete Confirm Dialog */}
+			<ConfirmDialog
+				open={!!deletingRegistry()}
+				title="Delete Registry"
+				onConfirm={confirmDeleteRegistry}
+				onCancel={() => setDeletingRegistry(null)}
+				confirmLabel="Delete"
+				variant="danger"
+			>
+				<p class="text-sm text-[var(--color-text-secondary)]">
+					Delete registry "{deletingRegistry()?.name}"? This cannot be undone.
+				</p>
+			</ConfirmDialog>
 		</div>
 	);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Registry Form Modal (Create / Edit)
-// ═══════════════════════════════════════════════════════════════════════════
 
 interface RegistryFormModalProps {
 	projectId: string;
@@ -656,14 +671,18 @@ function ImageBrowserModal(props: ImageBrowserModalProps) {
 		}
 	}
 
-	async function deleteTag(imageName: string, tagName: string) {
-		if (!confirm(`Delete tag "${tagName}" from "${imageName}"? This cannot be undone.`)) return;
+	const [deletingTag, setDeletingTag] = createSignal<{ imageName: string; tagName: string } | null>(null);
+
+	async function confirmDeleteTag() {
+		const info = deletingTag();
+		if (!info) return;
 		try {
-			await api.registries.deleteTag(props.projectId, props.registry.id, imageName, tagName);
-			// Reload tags
-			await loadTags(imageName);
+			await api.registries.deleteTag(props.projectId, props.registry.id, info.imageName, info.tagName);
+			await loadTags(info.imageName);
 		} catch (err: any) {
 			setTagsError(err.message || 'Failed to delete tag');
+		} finally {
+			setDeletingTag(null);
 		}
 	}
 
@@ -793,7 +812,7 @@ function ImageBrowserModal(props: ImageBrowserModalProps) {
 														</td>
 														<td class="py-2.5">
 															<button
-																onClick={() => deleteTag(selectedImage()!, tag.name)}
+																onClick={() => setDeletingTag({ imageName: selectedImage()!, tagName: tag.name })}
 																class="text-xs text-red-400 hover:text-red-300"
 															>
 																Delete
@@ -810,6 +829,20 @@ function ImageBrowserModal(props: ImageBrowserModalProps) {
 					</Show>
 				</div>
 			</div>
+
+			{/* Delete Tag Confirm Dialog */}
+			<ConfirmDialog
+				open={!!deletingTag()}
+				title="Delete Tag"
+				onConfirm={confirmDeleteTag}
+				onCancel={() => setDeletingTag(null)}
+				confirmLabel="Delete"
+				variant="danger"
+			>
+				<p class="text-sm text-[var(--color-text-secondary)]">
+					Delete tag "{deletingTag()?.tagName}" from "{deletingTag()?.imageName}"? This cannot be undone.
+				</p>
+			</ConfirmDialog>
 		</div>
 	);
 }

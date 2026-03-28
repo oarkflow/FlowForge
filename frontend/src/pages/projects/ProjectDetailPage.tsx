@@ -1,6 +1,6 @@
 import type { Component } from 'solid-js';
-import { createSignal, createResource, createMemo, For, Show, Switch, Match } from 'solid-js';
-import { useParams, A, useNavigate } from '@solidjs/router';
+import { createSignal, createResource, createMemo, createEffect, For, Show, Switch, Match } from 'solid-js';
+import { useParams, A, useNavigate, useSearchParams } from '@solidjs/router';
 import PageContainer from '../../components/layout/PageContainer';
 import Card from '../../components/ui/Card';
 import Badge from '../../components/ui/Badge';
@@ -56,8 +56,21 @@ async function fetchProject(id: string) {
 const ProjectDetailPage: Component = () => {
 	const params = useParams<{ id: string }>();
 	const navigate = useNavigate();
-	const [activeTab, setActiveTab] = createSignal('overview');
+	const [searchParams, setSearchParams] = useSearchParams<{ tab?: string }>();
+	const validTabs = ['overview', 'pipelines', 'environments', 'registries', 'providers', 'runs', 'repositories', 'environment', 'secrets', 'notifications', 'settings'];
+	const initialTab = validTabs.includes(searchParams.tab || '') ? searchParams.tab! : 'overview';
+	const [activeTab, setActiveTab] = createSignal(initialTab);
+	const [showSetupBanner, setShowSetupBanner] = createSignal(searchParams.tab === 'secrets' || searchParams.tab === 'environment');
 	const [data, { refetch }] = createResource(() => params.id, fetchProject);
+
+	// Initialize tab-specific state when data loads and URL tab is set.
+	createEffect(() => {
+		if (data() && !data.loading) {
+			const tab = activeTab();
+			if (tab === 'settings') initSettings();
+			if (tab === 'environment') initEnvVars();
+		}
+	});
 
 	// Run table columns (inside component for access to params.id)
 	const runColumns = createMemo((): TableColumn<PipelineRun>[] => [
@@ -130,6 +143,11 @@ const ProjectDetailPage: Component = () => {
 	const [newSecretKey, setNewSecretKey] = createSignal('');
 	const [newSecretValue, setNewSecretValue] = createSignal('');
 	const [savingSecret, setSavingSecret] = createSignal(false);
+
+	// Update secret (for setting value on empty/imported secrets)
+	const [editingSecretId, setEditingSecretId] = createSignal<string | null>(null);
+	const [editSecretValue, setEditSecretValue] = createSignal('');
+	const [updatingSecret, setUpdatingSecret] = createSignal(false);
 
 	// Confirm delete
 	const [showDeleteConfirm, setShowDeleteConfirm] = createSignal(false);
@@ -300,6 +318,23 @@ const ProjectDetailPage: Component = () => {
 		}
 	};
 
+	const handleUpdateSecret = async (secretId: string) => {
+		const val = editSecretValue().trim();
+		if (!val) return;
+		setUpdatingSecret(true);
+		try {
+			await api.secrets.update(params.id, secretId, val);
+			toast.success('Secret value updated');
+			setEditingSecretId(null);
+			setEditSecretValue('');
+			refetch();
+		} catch (err) {
+			toast.error(err instanceof ApiRequestError ? err.message : 'Failed to update secret');
+		} finally {
+			setUpdatingSecret(false);
+		}
+	};
+
 	const handleSyncRepo = async (repoId: string) => {
 		try {
 			await api.repositories.sync(params.id, repoId);
@@ -387,7 +422,7 @@ const ProjectDetailPage: Component = () => {
 			<Show when={!data.loading && data()} fallback={
 				<div class="space-y-4"><div class="h-10 bg-[var(--color-bg-secondary)] rounded animate-pulse" /><div class="h-64 bg-[var(--color-bg-secondary)] rounded-xl animate-pulse" /></div>
 			}>
-				<Tabs tabs={tabs()} activeTab={activeTab()} onTabChange={(id) => { setActiveTab(id); if (id === 'settings') initSettings(); if (id === 'environment') initEnvVars(); }} class="mb-6" />
+				<Tabs tabs={tabs()} activeTab={activeTab()} onTabChange={(id) => { setActiveTab(id); setSearchParams({ tab: id === 'overview' ? undefined : id }); setShowSetupBanner(false); if (id === 'settings') initSettings(); if (id === 'environment') initEnvVars(); }} class="mb-6" />
 
 				<Switch>
 					{/* Overview */}
@@ -568,6 +603,12 @@ const ProjectDetailPage: Component = () => {
 
 					{/* Environment Variables */}
 					<Match when={activeTab() === 'environment'}>
+						<Show when={showSetupBanner()}>
+							<div class="mb-4 p-4 rounded-xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-between">
+								<p class="text-sm text-blue-400">Your pipeline references environment variables that need to be configured before running.</p>
+								<button class="text-xs text-blue-400/60 hover:text-blue-400 ml-4 shrink-0" onClick={() => setShowSetupBanner(false)}>Dismiss</button>
+							</div>
+						</Show>
 						<Card title="Environment Variables" description="Non-secret key-value pairs available to all pipelines in this project. For sensitive values, use the Secrets tab instead.">
 							<KeyValueEditor
 								items={envVarItems()}
@@ -590,6 +631,12 @@ const ProjectDetailPage: Component = () => {
 
 					{/* Secrets */}
 					<Match when={activeTab() === 'secrets'}>
+						<Show when={showSetupBanner()}>
+							<div class="mb-4 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between">
+								<p class="text-sm text-amber-400">Your pipeline references secrets that need to be configured before running.</p>
+								<button class="text-xs text-amber-400/60 hover:text-amber-400 ml-4 shrink-0" onClick={() => setShowSetupBanner(false)}>Dismiss</button>
+							</div>
+						</Show>
 						<Card title="Project Secrets" description="Encrypted secrets available to all pipelines" actions={
 							<Button size="sm" onClick={() => setShowAddSecret(true)}>Add Secret</Button>
 						} padding={false}>
@@ -606,12 +653,47 @@ const ProjectDetailPage: Component = () => {
 									<tbody>
 										<For each={data()?.secrets ?? []}>
 											{(secret) => (
-												<tr class="border-b border-[var(--color-border-primary)] last:border-b-0 hover:bg-[var(--color-bg-hover)]">
-													<td class="px-5 py-3"><span class="text-sm font-mono font-medium text-[var(--color-text-primary)]">{secret.key}</span></td>
-													<td class="px-5 py-3"><span class="text-sm font-mono text-[var(--color-text-tertiary)]">••••••••</span></td>
+												<tr class={`border-b border-[var(--color-border-primary)] last:border-b-0 hover:bg-[var(--color-bg-hover)] ${secret.is_empty ? 'bg-amber-500/5' : ''}`}>
+													<td class="px-5 py-3">
+														<div class="flex items-center gap-2">
+															<span class="text-sm font-mono font-medium text-[var(--color-text-primary)]">{secret.key}</span>
+															<Show when={secret.is_empty}>
+																<Badge variant="warning" size="sm">Not set</Badge>
+															</Show>
+														</div>
+													</td>
+													<td class="px-5 py-3">
+														<Show when={editingSecretId() === secret.id} fallback={
+															<Show when={secret.is_empty} fallback={
+																<span class="text-sm font-mono text-[var(--color-text-tertiary)]">••••••••</span>
+															}>
+																<span class="text-sm text-amber-400/80 italic">Empty — click Set Value to configure</span>
+															</Show>
+														}>
+															<div class="flex items-center gap-2">
+																<input
+																	type="password"
+																	class="flex-1 text-sm px-2 py-1 rounded border border-[var(--color-border-primary)] bg-[var(--color-bg-primary)] text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-indigo-500"
+																	placeholder="Enter secret value..."
+																	value={editSecretValue()}
+																	onInput={(e) => setEditSecretValue(e.currentTarget.value)}
+																	autofocus
+																/>
+																<Button size="sm" onClick={() => handleUpdateSecret(secret.id)} loading={updatingSecret()} disabled={!editSecretValue().trim()}>Save</Button>
+																<Button size="sm" variant="ghost" onClick={() => { setEditingSecretId(null); setEditSecretValue(''); }}>Cancel</Button>
+															</div>
+														</Show>
+													</td>
 													<td class="px-5 py-3 text-xs text-[var(--color-text-tertiary)]">{formatRelativeTime(secret.updated_at)}</td>
 													<td class="px-5 py-3 text-right">
-														<Button size="sm" variant="danger" onClick={() => handleDeleteSecret(secret.id, secret.key)}>Delete</Button>
+														<div class="flex items-center justify-end gap-2">
+															<Show when={editingSecretId() !== secret.id}>
+																<Button size="sm" variant={secret.is_empty ? 'primary' : 'outline'} onClick={() => { setEditingSecretId(secret.id); setEditSecretValue(''); }}>
+																	{secret.is_empty ? 'Set Value' : 'Update'}
+																</Button>
+															</Show>
+															<Button size="sm" variant="danger" onClick={() => handleDeleteSecret(secret.id, secret.key)}>Delete</Button>
+														</div>
 													</td>
 												</tr>
 											)}

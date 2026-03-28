@@ -51,6 +51,24 @@ func detectLanguages(idx *fileIndex) []DetectionResult {
 	return results
 }
 
+// detectInfrastructure runs every infrastructure detector against the file
+// index and returns the combined results.
+func detectInfrastructure(idx *fileIndex) []DetectionResult {
+	var results []DetectionResult
+	for _, det := range infrastructureDetectors() {
+		if det.detect != nil {
+			if r := det.detect(idx); r != nil {
+				results = append(results, *r)
+			}
+			continue
+		}
+		if r := runGenericDetector(idx, det); r != nil {
+			results = append(results, *r)
+		}
+	}
+	return results
+}
+
 // runGenericDetector uses indicator files and extension counts to determine
 // whether a language is present and with what confidence.
 func runGenericDetector(idx *fileIndex, det languageDetector) *DetectionResult {

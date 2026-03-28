@@ -1,6 +1,7 @@
 import { createSignal, createEffect, Show, For, onMount } from 'solid-js';
 import { api } from '../../api/client';
 import type { ProjectDeploymentProvider, DeploymentProviderType } from '../../types';
+import ConfirmDialog from '../ui/ConfirmDialog';
 
 // ─── Provider type metadata ─────────────────────────────────────────────────
 const PROVIDER_TYPES: { value: DeploymentProviderType; label: string; icon: string }[] = [
@@ -41,6 +42,7 @@ export default function DeploymentProvidersTab(props: DeploymentProvidersTabProp
 	// Modal states
 	const [showCreateModal, setShowCreateModal] = createSignal(false);
 	const [editingProvider, setEditingProvider] = createSignal<ProjectDeploymentProvider | null>(null);
+	const [deletingProvider, setDeletingProvider] = createSignal<ProjectDeploymentProvider | null>(null);
 
 	// Test result states
 	const [testResults, setTestResults] = createSignal<Record<string, { success: boolean; message: string }>>({});
@@ -81,13 +83,16 @@ export default function DeploymentProvidersTab(props: DeploymentProvidersTabProp
 	}
 
 	// ─── Delete provider ──────────────────────────────────────────────────────
-	async function deleteProvider(provider: ProjectDeploymentProvider) {
-		if (!confirm(`Delete provider "${provider.name}"? This cannot be undone.`)) return;
+	async function confirmDeleteProvider() {
+		const provider = deletingProvider();
+		if (!provider) return;
 		try {
 			await api.deploymentProviders.delete(props.projectId, provider.id);
 			await loadProviders();
 		} catch (err: any) {
 			setError(err.message || 'Failed to delete provider');
+		} finally {
+			setDeletingProvider(null);
 		}
 	}
 
@@ -226,7 +231,7 @@ export default function DeploymentProvidersTab(props: DeploymentProvidersTabProp
 											Edit
 										</button>
 										<button
-											onClick={() => deleteProvider(provider)}
+											onClick={() => setDeletingProvider(provider)}
 											class="px-3 py-1.5 text-xs bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded-lg transition-colors"
 										>
 											Delete
@@ -257,6 +262,20 @@ export default function DeploymentProvidersTab(props: DeploymentProvidersTabProp
 					onSaved={() => { setEditingProvider(null); loadProviders(); }}
 				/>
 			</Show>
+
+			{/* Delete Confirm Dialog */}
+			<ConfirmDialog
+				open={!!deletingProvider()}
+				title="Delete Provider"
+				onConfirm={confirmDeleteProvider}
+				onCancel={() => setDeletingProvider(null)}
+				confirmLabel="Delete"
+				variant="danger"
+			>
+				<p class="text-sm text-[var(--color-text-secondary)]">
+					Delete provider "{deletingProvider()?.name}"? This cannot be undone.
+				</p>
+			</ConfirmDialog>
 		</div>
 	);
 }

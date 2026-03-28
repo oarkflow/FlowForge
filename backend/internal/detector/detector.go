@@ -172,6 +172,10 @@ func Detect(rootDir string) ([]DetectionResult, error) {
 	langResults := detectLanguages(idx)
 	results = append(results, langResults...)
 
+	// Run infrastructure detectors.
+	infraResults := detectInfrastructure(idx)
+	results = append(results, infraResults...)
+
 	// Enrich with framework detection.
 	results = detectFrameworks(idx, results)
 

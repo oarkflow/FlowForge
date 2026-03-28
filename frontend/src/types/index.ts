@@ -212,6 +212,7 @@ export interface Secret {
 	scope: 'project' | 'org' | 'global';
 	key: string;
 	masked: boolean;
+	is_empty?: boolean;
 	created_by?: string;
 	created_at: string;
 	updated_at: string;
@@ -399,6 +400,15 @@ export interface ImportDetectResponse {
 	generated_pipeline: string;
 	default_branch: string;
 	clone_url: string;
+	extracted_env_vars: ExtractedVariable[];
+	extracted_secrets: ExtractedVariable[];
+}
+
+export interface ExtractedVariable {
+	name: string;
+	type: 'env_var' | 'secret';
+	source: string;
+	has_value: boolean;
 }
 
 export interface ImportCreateProjectRequest {
@@ -420,6 +430,8 @@ export interface ImportCreateProjectRequest {
 	};
 	pipeline_yaml: string;
 	setup_webhook: boolean;
+	extracted_env_vars?: ExtractedVariable[];
+	extracted_secrets?: ExtractedVariable[];
 }
 
 export interface ImportCreateProjectResponse {

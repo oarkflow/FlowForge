@@ -165,3 +165,28 @@ func sanitizePath(destDir, name string) (string, error) {
 	}
 	return target, nil
 }
+
+// UnwrapSingleSubfolder checks whether dir contains exactly one entry and
+// that entry is a directory. If so it returns the path to that inner directory.
+// This handles the common case where a zip archive wraps everything inside a
+// single top-level folder (e.g. "my-project/") so the detector sees the
+// project root directly instead of an empty-looking wrapper.
+func UnwrapSingleSubfolder(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return dir
+	}
+
+	// Filter out hidden files/dirs (like __MACOSX) that archives sometimes include.
+	var visible []os.DirEntry
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".") && e.Name() != "__MACOSX" {
+			visible = append(visible, e)
+		}
+	}
+
+	if len(visible) == 1 && visible[0].IsDir() {
+		return filepath.Join(dir, visible[0].Name())
+	}
+	return dir
+}

@@ -33,6 +33,7 @@ type SecretMetadata struct {
 	Scope     string    `json:"scope"`
 	Key       string    `json:"key"`
 	Masked    int       `json:"masked"`
+	IsEmpty   bool      `json:"is_empty"`
 	CreatedBy *string   `json:"created_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -67,6 +68,35 @@ func (s *SecretStore) Create(ctx context.Context, projectID, key, value, created
 	encrypted, err := crypto.Encrypt(s.encryptionKey, value)
 	if err != nil {
 		return fmt.Errorf("encrypting secret: %w", err)
+	}
+
+	secret := &models.Secret{
+		ProjectID: &projectID,
+		Scope:     "project",
+		Key:       key,
+		ValueEnc:  encrypted,
+		Masked:    1,
+		CreatedBy: &createdBy,
+	}
+
+	if err := s.repos.Secrets.Create(ctx, secret); err != nil {
+		return fmt.Errorf("storing secret: %w", err)
+	}
+	return nil
+}
+
+// CreateEmpty creates a secret placeholder with an empty encrypted value.
+// This is used during project import to pre-populate secret keys that
+// the pipeline references so the user can fill them in later.
+func (s *SecretStore) CreateEmpty(ctx context.Context, projectID, key, createdBy string) error {
+	if key == "" {
+		return errors.New("secret key must not be empty")
+	}
+
+	// Encrypt an empty string as a placeholder.
+	encrypted, err := crypto.Encrypt(s.encryptionKey, "")
+	if err != nil {
+		return fmt.Errorf("encrypting empty secret: %w", err)
 	}
 
 	secret := &models.Secret{
@@ -119,6 +149,11 @@ func (s *SecretStore) List(ctx context.Context, projectID string, limit, offset 
 
 	result := make([]SecretMetadata, len(secrets))
 	for i, sec := range secrets {
+		// Check if the secret value is empty (placeholder from import).
+		isEmpty := false
+		if plaintext, err := crypto.Decrypt(s.encryptionKey, sec.ValueEnc); err == nil {
+			isEmpty = plaintext == ""
+		}
 		result[i] = SecretMetadata{
 			ID:        sec.ID,
 			ProjectID: sec.ProjectID,
@@ -126,6 +161,7 @@ func (s *SecretStore) List(ctx context.Context, projectID string, limit, offset 
 			Scope:     sec.Scope,
 			Key:       sec.Key,
 			Masked:    sec.Masked,
+			IsEmpty:   isEmpty,
 			CreatedBy: sec.CreatedBy,
 			CreatedAt: sec.CreatedAt,
 			UpdatedAt: sec.UpdatedAt,
