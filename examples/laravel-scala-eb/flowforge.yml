@@ -1,0 +1,671 @@
+# ==============================================================================
+# Laravel/PHP Web + Scala API Interface + Scala WAR Service
+# Deploy to AWS Elastic Beanstalk with Tomcat
+#
+# Build order (dependency chain):
+#   1. Package Scala API Interface JAR (shared dependency)
+#   2. Move API Interface JAR to Scala Service workspace
+#   3. Build Scala Service WAR (depends on API Interface)
+#   4. Composer install + test + zip Laravel Web
+#   5. Deploy Laravel Web to Elastic Beanstalk (A)
+#   6. Deploy Scala WAR Service to Elastic Beanstalk with Tomcat
+#   7. Run migrations on the service
+#   8. All necessary post-deploy operations
+# ==============================================================================
+
+version: "1"
+name: "Laravel + Scala — Elastic Beanstalk Deploy"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+defaults:
+  executor: docker
+  image: sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_2.13.18
+  timeout: 45m
+
+env:
+  APP_ENV: "production"
+  AWS_REGION: "${AWS_REGION:-us-east-1}"
+  AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
+  AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
+  EB_WEB_APP: "${EB_WEB_APP}"
+  EB_WEB_ENV: "${EB_WEB_ENV}"
+  EB_SERVICE_APP: "${EB_SERVICE_APP}"
+  EB_SERVICE_ENV: "${EB_SERVICE_ENV}"
+  S3_BUCKET: "${S3_BUCKET}"
+
+stages:
+  - build-api-interface
+  - build-scala-service
+  - build-web
+  - package
+  - deploy-web
+  - deploy-service
+  - post-deploy
+  - verify
+
+jobs:
+  # ==========================================================================
+  # Stage 1: Package the Scala API Interface JAR
+  # This is the shared library that the Scala Service depends on.
+  # ==========================================================================
+  build-api-interface:
+    stage: build-api-interface
+    executor: docker
+    image: sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_2.13.18
+    cache:
+      key: sbt-api-{{ hash "scala-api-interface/build.sbt" }}
+      paths:
+        - ~/.sbt
+        - ~/.ivy2/cache
+        - ~/.cache/coursier
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Resolve API Interface dependencies
+        run: |
+          cd scala-api-interface
+          sbt update
+      - name: Compile API Interface
+        run: |
+          cd scala-api-interface
+          sbt compile
+      - name: Run API Interface tests
+        run: |
+          cd scala-api-interface
+          sbt test
+      - name: Package API Interface JAR
+        run: |
+          cd scala-api-interface
+          sbt package
+
+          # Find the packaged JAR
+          API_JAR=$(find target -name "*.jar" -path "*/scala-*/*.jar" | head -1)
+          echo "API Interface JAR: $API_JAR"
+
+          # Copy to a known location for upload
+          mkdir -p /tmp/artifacts
+          cp "$API_JAR" /tmp/artifacts/api-interface.jar
+          echo "API_INTERFACE_JAR=api-interface.jar" >> $FLOWFORGE_ENV
+      - name: Upload API Interface JAR
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: api-interface-jar
+          path: /tmp/artifacts/api-interface.jar
+
+  # ==========================================================================
+  # Stage 2: Build Scala WAR Service
+  # Depends on API Interface JAR — must be placed in the service's lib/ first
+  # ==========================================================================
+  build-scala-service:
+    stage: build-scala-service
+    executor: docker
+    image: sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.7_2.13.18
+    cache:
+      key: sbt-service-{{ hash "scala-service/build.sbt" }}
+      paths:
+        - ~/.sbt
+        - ~/.ivy2/cache
+        - ~/.cache/coursier
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download API Interface JAR
+        uses: flowforge/download-artifact@v1
+        with:
+          name: api-interface-jar
+          path: /tmp/artifacts/
+      - name: Move API Interface JAR to Scala Service workspace
+        run: |
+          # Place the API Interface JAR in the service's lib/ directory
+          # so sbt picks it up as an unmanaged dependency
+          mkdir -p scala-service/lib
+          cp /tmp/artifacts/api-interface.jar scala-service/lib/
+
+          echo "=== API Interface JAR placed in scala-service/lib/ ==="
+          ls -la scala-service/lib/
+      - name: Resolve Scala Service dependencies
+        run: |
+          cd scala-service
+          sbt update
+      - name: Compile Scala Service
+        run: |
+          cd scala-service
+          sbt compile
+      - name: Run Scala Service tests
+        run: |
+          cd scala-service
+          sbt test
+      - name: Package Scala Service WAR
+        run: |
+          cd scala-service
+          sbt package
+
+          # For WAR packaging, ensure the sbt-web or xsbt-web-plugin is configured
+          # The WAR file should be in target/scala-X.X/
+          WAR_FILE=$(find target -name "*.war" | head -1)
+
+          if [ -z "$WAR_FILE" ]; then
+            echo "No WAR found, trying sbt war:package..."
+            sbt "war:package" || sbt "webApp:packageWar" || true
+            WAR_FILE=$(find target -name "*.war" | head -1)
+          fi
+
+          if [ -z "$WAR_FILE" ]; then
+            echo "ERROR: No WAR file produced!"
+            exit 1
+          fi
+
+          echo "WAR file: $WAR_FILE"
+          mkdir -p /tmp/artifacts
+          cp "$WAR_FILE" /tmp/artifacts/service.war
+      - name: Upload Scala Service WAR
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: scala-service-war
+          path: /tmp/artifacts/service.war
+
+  # ==========================================================================
+  # Stage 3: Build Laravel Web — composer install, test, zip
+  # ==========================================================================
+  test-web:
+    stage: build-web
+    executor: docker
+    image: php:8.3-cli
+    cache:
+      key: composer-{{ hash "web/composer.lock" }}
+      paths:
+        - web/vendor
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install PHP extensions and Composer
+        run: |
+          apt-get update && apt-get install -y unzip git libzip-dev libpq-dev
+          docker-php-ext-install zip pdo pdo_mysql pdo_pgsql
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+      - name: Composer install (with dev for testing)
+        run: |
+          cd web
+          composer install --no-interaction --prefer-dist
+      - name: Copy environment file
+        run: |
+          cd web
+          cp .env.example .env
+          php artisan key:generate
+      - name: Run Laravel tests
+        run: |
+          cd web
+          php artisan test --parallel
+      - name: Run lint
+        run: |
+          cd web
+          vendor/bin/php-cs-fixer fix --dry-run --diff 2>/dev/null || true
+
+  package-web:
+    stage: build-web
+    executor: docker
+    image: php:8.3-cli
+    cache:
+      key: composer-{{ hash "web/composer.lock" }}
+      paths:
+        - web/vendor
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install tools
+        run: |
+          apt-get update && apt-get install -y unzip git libzip-dev zip
+          docker-php-ext-install zip
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+      - name: Composer install (production)
+        run: |
+          cd web
+          composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+      - name: Create Laravel deployment ZIP
+        run: |
+          cd web
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+
+          # Remove dev/test artifacts
+          rm -rf tests/ .env.testing phpunit.xml
+          rm -rf .git/ .github/ node_modules/
+          rm -rf storage/logs/*.log
+
+          # Create ZIP for Elastic Beanstalk
+          zip -r "/tmp/web-${TIMESTAMP}.zip" . \
+            -x "*.git*" \
+            -x "tests/*" \
+            -x "node_modules/*" \
+            -x "storage/logs/*"
+
+          echo "WEB_ZIP=web-${TIMESTAMP}.zip" >> $FLOWFORGE_ENV
+          echo "Package created: web-${TIMESTAMP}.zip"
+          ls -lh "/tmp/web-${TIMESTAMP}.zip"
+      - name: Upload Web ZIP
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: web-zip
+          path: /tmp/web-*.zip
+
+  # ==========================================================================
+  # Stage 4: Package — prepare EB deployment bundles
+  # ==========================================================================
+  package-eb-web:
+    stage: package
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download Web ZIP
+        uses: flowforge/download-artifact@v1
+        with:
+          name: web-zip
+          path: /tmp/
+      - name: Upload Web ZIP to S3
+        run: |
+          WEB_ZIP=$(ls /tmp/web-*.zip | head -1)
+          WEB_KEY="releases/web/$(basename $WEB_ZIP)"
+
+          aws s3 cp "$WEB_ZIP" "s3://${S3_BUCKET}/${WEB_KEY}"
+
+          echo "EB_WEB_S3_KEY=${WEB_KEY}" >> $FLOWFORGE_ENV
+          echo "Uploaded to s3://${S3_BUCKET}/${WEB_KEY}"
+
+  package-eb-service:
+    stage: package
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download Scala Service WAR
+        uses: flowforge/download-artifact@v1
+        with:
+          name: scala-service-war
+          path: /tmp/
+      - name: Create Elastic Beanstalk bundle for Tomcat
+        run: |
+          # EB with Tomcat expects the WAR file in a specific structure
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          BUNDLE_DIR="/tmp/eb-service-${TIMESTAMP}"
+
+          mkdir -p "${BUNDLE_DIR}"
+
+          # Copy WAR — Tomcat EB platform expects ROOT.war for the default context
+          cp /tmp/service.war "${BUNDLE_DIR}/ROOT.war"
+
+          # Create Procfile for Elastic Beanstalk (optional with Tomcat)
+          # The Tomcat platform auto-deploys WAR files
+
+          # Create .ebextensions for custom configuration
+          mkdir -p "${BUNDLE_DIR}/.ebextensions"
+
+          cat > "${BUNDLE_DIR}/.ebextensions/01-jvm-options.config" << 'EBEXT'
+          option_settings:
+            aws:elasticbeanstalk:container:tomcat:jvmoptions:
+              Xms: 512m
+              Xmx: 1024m
+              JVM Options: "-Dapp.env=production -Dconfig.file=/var/app/current/application.conf"
+          EBEXT
+
+          cat > "${BUNDLE_DIR}/.ebextensions/02-env-vars.config" << 'EBEXT'
+          option_settings:
+            aws:elasticbeanstalk:application:environment:
+              APP_ENV: production
+              DB_HOST: '`{"Ref": "RDSEndpoint"}`'
+          EBEXT
+
+          # Create the deployment ZIP
+          cd "${BUNDLE_DIR}"
+          zip -r "/tmp/service-${TIMESTAMP}.zip" .
+
+          echo "SERVICE_ZIP=service-${TIMESTAMP}.zip" >> $FLOWFORGE_ENV
+          echo "Bundle created: service-${TIMESTAMP}.zip"
+      - name: Upload Service bundle to S3
+        run: |
+          SERVICE_ZIP=$(ls /tmp/service-*.zip | head -1)
+          SERVICE_KEY="releases/service/$(basename $SERVICE_ZIP)"
+
+          aws s3 cp "$SERVICE_ZIP" "s3://${S3_BUCKET}/${SERVICE_KEY}"
+
+          echo "EB_SERVICE_S3_KEY=${SERVICE_KEY}" >> $FLOWFORGE_ENV
+          echo "Uploaded to s3://${S3_BUCKET}/${SERVICE_KEY}"
+
+  # ==========================================================================
+  # Stage 5: Deploy Laravel Web to Elastic Beanstalk (Environment A)
+  # ==========================================================================
+  deploy-web:
+    stage: deploy-web
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Create EB application version for Web
+        run: |
+          VERSION_LABEL="web-$(date +%Y%m%d%H%M%S)"
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "${EB_WEB_APP}" \
+            --version-label "${VERSION_LABEL}" \
+            --source-bundle "S3Bucket=${S3_BUCKET},S3Key=${EB_WEB_S3_KEY}" \
+            --region "${AWS_REGION}"
+
+          echo "Created application version: ${VERSION_LABEL}"
+          echo "EB_WEB_VERSION=${VERSION_LABEL}" >> $FLOWFORGE_ENV
+      - name: Deploy Web to Elastic Beanstalk
+        run: |
+          echo "=== Deploying Laravel Web to EB environment: ${EB_WEB_ENV} ==="
+
+          aws elasticbeanstalk update-environment \
+            --application-name "${EB_WEB_APP}" \
+            --environment-name "${EB_WEB_ENV}" \
+            --version-label "${EB_WEB_VERSION}" \
+            --region "${AWS_REGION}"
+
+          echo "Deployment initiated. Waiting for environment to be ready..."
+      - name: Wait for Web deployment to complete
+        run: |
+          echo "Waiting for environment ${EB_WEB_ENV} to reach 'Ready' status..."
+
+          aws elasticbeanstalk wait environment-updated \
+            --application-name "${EB_WEB_APP}" \
+            --environment-names "${EB_WEB_ENV}" \
+            --region "${AWS_REGION}" \
+            || {
+              echo "WARNING: Wait timed out. Checking status..."
+              aws elasticbeanstalk describe-environments \
+                --application-name "${EB_WEB_APP}" \
+                --environment-names "${EB_WEB_ENV}" \
+                --region "${AWS_REGION}" \
+                --query "Environments[0].{Status:Status,Health:Health,HealthStatus:HealthStatus}"
+            }
+
+          # Get environment info
+          aws elasticbeanstalk describe-environments \
+            --application-name "${EB_WEB_APP}" \
+            --environment-names "${EB_WEB_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].{CNAME:CNAME,Status:Status,Health:Health}" \
+            --output table
+
+          echo "=== Web deployment complete ==="
+
+  # ==========================================================================
+  # Stage 6: Deploy Scala WAR Service to Elastic Beanstalk with Tomcat
+  # ==========================================================================
+  deploy-service:
+    stage: deploy-service
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Create EB application version for Service
+        run: |
+          VERSION_LABEL="service-$(date +%Y%m%d%H%M%S)"
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "${EB_SERVICE_APP}" \
+            --version-label "${VERSION_LABEL}" \
+            --source-bundle "S3Bucket=${S3_BUCKET},S3Key=${EB_SERVICE_S3_KEY}" \
+            --region "${AWS_REGION}"
+
+          echo "Created application version: ${VERSION_LABEL}"
+          echo "EB_SERVICE_VERSION=${VERSION_LABEL}" >> $FLOWFORGE_ENV
+      - name: Deploy Scala Service to Elastic Beanstalk (Tomcat)
+        run: |
+          echo "=== Deploying Scala WAR Service to EB environment: ${EB_SERVICE_ENV} ==="
+
+          aws elasticbeanstalk update-environment \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-name "${EB_SERVICE_ENV}" \
+            --version-label "${EB_SERVICE_VERSION}" \
+            --region "${AWS_REGION}"
+
+          echo "Deployment initiated. Waiting for environment to be ready..."
+      - name: Wait for Service deployment to complete
+        run: |
+          echo "Waiting for environment ${EB_SERVICE_ENV} to reach 'Ready' status..."
+
+          aws elasticbeanstalk wait environment-updated \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-names "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            || {
+              echo "WARNING: Wait timed out. Checking status..."
+              aws elasticbeanstalk describe-environments \
+                --application-name "${EB_SERVICE_APP}" \
+                --environment-names "${EB_SERVICE_ENV}" \
+                --region "${AWS_REGION}" \
+                --query "Environments[0].{Status:Status,Health:Health,HealthStatus:HealthStatus}"
+            }
+
+          # Get environment info
+          aws elasticbeanstalk describe-environments \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-names "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].{CNAME:CNAME,Status:Status,Health:Health}" \
+            --output table
+
+          echo "=== Service deployment complete ==="
+
+  # ==========================================================================
+  # Stage 7: Post-deploy — run migrations and configure services
+  # ==========================================================================
+  migrate-service:
+    stage: post-deploy
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run database migrations on Scala Service
+        run: |
+          echo "=== Running Scala Service database migrations ==="
+
+          # Get the service endpoint
+          SERVICE_CNAME=$(aws elasticbeanstalk describe-environments \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-names "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].CNAME" \
+            --output text)
+
+          echo "Service endpoint: http://${SERVICE_CNAME}"
+
+          # Trigger migration via the service's migration endpoint
+          # (The Scala service should expose a /admin/migrate endpoint protected by auth)
+          MIGRATION_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${SERVICE_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "http://${SERVICE_CNAME}/admin/migrate")
+
+          HTTP_CODE=$(echo "$MIGRATION_RESPONSE" | tail -1)
+          BODY=$(echo "$MIGRATION_RESPONSE" | sed '$d')
+
+          echo "Response (HTTP ${HTTP_CODE}): ${BODY}"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Migrations completed successfully"
+          else
+            echo "ERROR: Migration failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+  migrate-web:
+    stage: post-deploy
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run Laravel migrations via EB SSH
+        run: |
+          echo "=== Running Laravel database migrations ==="
+
+          # Use EB managed SSH to run artisan commands
+          # This requires the EB CLI or direct SSM/SSH access
+
+          # Option 1: Use SSM Run Command (if instances have SSM agent)
+          INSTANCE_ID=$(aws elasticbeanstalk describe-environment-resources \
+            --environment-name "${EB_WEB_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "EnvironmentResources.Instances[0].Id" \
+            --output text)
+
+          echo "Running migrations on instance: ${INSTANCE_ID}"
+
+          aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["cd /var/app/current && php artisan migrate --force && php artisan config:cache && php artisan route:cache && php artisan view:cache"]}' \
+            --region "${AWS_REGION}" \
+            --output text
+
+          echo "Laravel migrations triggered"
+
+  configure-web-env:
+    stage: post-deploy
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Update Elastic Beanstalk Web environment variables
+        run: |
+          # Get the Scala Service endpoint for Laravel to connect to
+          SERVICE_CNAME=$(aws elasticbeanstalk describe-environments \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-names "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].CNAME" \
+            --output text)
+
+          echo "=== Updating Web environment variables ==="
+          echo "Service endpoint: http://${SERVICE_CNAME}"
+
+          aws elasticbeanstalk update-environment \
+            --application-name "${EB_WEB_APP}" \
+            --environment-name "${EB_WEB_ENV}" \
+            --region "${AWS_REGION}" \
+            --option-settings \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=APP_ENV,Value=production" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=APP_DEBUG,Value=false" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=SERVICE_URL,Value=http://${SERVICE_CNAME}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_HOST,Value=${DB_HOST}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_DATABASE,Value=${DB_DATABASE}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_USERNAME,Value=${DB_USERNAME}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_PASSWORD,Value=${DB_PASSWORD}"
+
+          echo "Web environment variables updated"
+
+  configure-service-env:
+    stage: post-deploy
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Update Elastic Beanstalk Service environment variables
+        run: |
+          echo "=== Updating Scala Service environment variables ==="
+
+          aws elasticbeanstalk update-environment \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-name "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            --option-settings \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=APP_ENV,Value=production" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_HOST,Value=${SERVICE_DB_HOST}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_NAME,Value=${SERVICE_DB_DATABASE}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_USER,Value=${SERVICE_DB_USERNAME}" \
+              "Namespace=aws:elasticbeanstalk:application:environment,OptionName=DB_PASSWORD,Value=${SERVICE_DB_PASSWORD}" \
+              "Namespace=aws:elasticbeanstalk:container:tomcat:jvmoptions,OptionName=Xms,Value=512m" \
+              "Namespace=aws:elasticbeanstalk:container:tomcat:jvmoptions,OptionName=Xmx,Value=1024m"
+
+          echo "Service environment variables updated"
+
+  # ==========================================================================
+  # Stage 8: Verify all deployments
+  # ==========================================================================
+  verify:
+    stage: verify
+    executor: docker
+    image: amazon/aws-cli:2.15.0
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Verify all EB environments
+        run: |
+          echo "=========================================="
+          echo "  Deployment Verification"
+          echo "=========================================="
+
+          # Web environment
+          echo ""
+          echo "--- Laravel Web (${EB_WEB_ENV}) ---"
+          aws elasticbeanstalk describe-environments \
+            --application-name "${EB_WEB_APP}" \
+            --environment-names "${EB_WEB_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].{CNAME:CNAME,Status:Status,Health:Health,HealthStatus:HealthStatus,Version:VersionLabel}" \
+            --output table
+
+          WEB_CNAME=$(aws elasticbeanstalk describe-environments \
+            --application-name "${EB_WEB_APP}" \
+            --environment-names "${EB_WEB_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].CNAME" \
+            --output text)
+
+          # Service environment
+          echo ""
+          echo "--- Scala Service (${EB_SERVICE_ENV}) ---"
+          aws elasticbeanstalk describe-environments \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-names "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].{CNAME:CNAME,Status:Status,Health:Health,HealthStatus:HealthStatus,Version:VersionLabel}" \
+            --output table
+
+          SERVICE_CNAME=$(aws elasticbeanstalk describe-environments \
+            --application-name "${EB_SERVICE_APP}" \
+            --environment-names "${EB_SERVICE_ENV}" \
+            --region "${AWS_REGION}" \
+            --query "Environments[0].CNAME" \
+            --output text)
+
+          # Health checks
+          echo ""
+          echo "--- Health Checks ---"
+
+          WEB_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${WEB_CNAME}/health" 2>/dev/null || echo "FAIL")
+          echo "Web health:     HTTP ${WEB_STATUS}"
+
+          SERVICE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${SERVICE_CNAME}/health" 2>/dev/null || echo "FAIL")
+          echo "Service health: HTTP ${SERVICE_STATUS}"
+
+          echo ""
+          echo "=========================================="
+          echo "  Web:     http://${WEB_CNAME}"
+          echo "  Service: http://${SERVICE_CNAME}"
+          echo "=========================================="
+
+          # Fail if any environment is not healthy
+          if [ "$WEB_STATUS" != "200" ] || [ "$SERVICE_STATUS" != "200" ]; then
+            echo ""
+            echo "WARNING: One or more health checks failed"
+            echo "Check the AWS EB console for detailed logs"
+          fi

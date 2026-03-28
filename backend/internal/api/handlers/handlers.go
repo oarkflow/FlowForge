@@ -32,26 +32,30 @@ type PipelineEngine interface {
 }
 
 type Handler struct {
-	db          *sqlx.DB
-	cfg         *config.Config
-	repo        *queries.Repositories
-	secretStore *secrets.SecretStore
-	audit       *auth.AuditLogger
-	importer    *importer.Service
-	engine      PipelineEngine
+	db              *sqlx.DB
+	cfg             *config.Config
+	repo            *queries.Repositories
+	secretStore     *secrets.SecretStore
+	secretScanner   *secrets.Scanner
+	rotationTracker *secrets.RotationTracker
+	audit           *auth.AuditLogger
+	importer        *importer.Service
+	engine          PipelineEngine
 }
 
 func New(db *sqlx.DB, cfg *config.Config, imp *importer.Service, engine PipelineEngine) *Handler {
 	repos := queries.NewRepositories(db)
 	encKey, _ := hex.DecodeString(cfg.EncryptionKey)
 	return &Handler{
-		db:          db,
-		cfg:         cfg,
-		repo:        repos,
-		secretStore: secrets.NewSecretStore(repos, encKey),
-		audit:       auth.NewAuditLogger(repos.AuditLogs),
-		importer:    imp,
-		engine:      engine,
+		db:              db,
+		cfg:             cfg,
+		repo:            repos,
+		secretStore:     secrets.NewSecretStore(repos, encKey),
+		secretScanner:   secrets.NewScanner(),
+		rotationTracker: secrets.NewRotationTracker(db, cfg.SecretRotationCheckInterval, nil),
+		audit:           auth.NewAuditLogger(repos.AuditLogs),
+		importer:        imp,
+		engine:          engine,
 	}
 }
 

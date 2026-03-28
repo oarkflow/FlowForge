@@ -1,0 +1,312 @@
+# ==============================================================================
+# Laravel PHP — Full CI/CD Pipeline
+# Install, test, zip, deploy to VPS Nginx root, migrate database, clean, update .env
+# ==============================================================================
+
+version: "1"
+name: "Laravel PHP — VPS Deploy"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+defaults:
+  executor: docker
+  image: php:8.3-cli
+  timeout: 30m
+
+env:
+  APP_ENV: "production"
+  VPS_HOST: "${VPS_HOST}"
+  VPS_USER: "${VPS_USER}"
+  VPS_DEPLOY_PATH: "/var/www/html"
+  DB_HOST: "${DB_HOST}"
+  DB_DATABASE: "${DB_DATABASE}"
+  DB_USERNAME: "${DB_USERNAME}"
+  DB_PASSWORD: "${DB_PASSWORD}"
+
+stages:
+  - install
+  - test
+  - package
+  - deploy
+  - post-deploy
+  - cleanup
+
+jobs:
+  install:
+    stage: install
+    executor: docker
+    image: composer:2
+    cache:
+      key: composer-{{ hash "composer.lock" }}
+      paths:
+        - vendor
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+      - name: Generate application key
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+  test:
+    stage: test
+    executor: docker
+    image: php:8.3-cli
+    cache:
+      key: composer-{{ hash "composer.lock" }}
+      paths:
+        - vendor
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install dev dependencies
+        run: |
+          apt-get update && apt-get install -y unzip git libzip-dev
+          docker-php-ext-install zip pdo pdo_mysql
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          composer install --no-interaction --prefer-dist
+      - name: Copy environment file
+        run: cp .env.example .env
+      - name: Generate application key
+        run: php artisan key:generate
+      - name: Run PHPUnit tests
+        run: php artisan test --parallel
+      - name: Run PHP CS Fixer (lint)
+        run: vendor/bin/php-cs-fixer fix --dry-run --diff
+      - name: Upload test results
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: test-results
+          path: storage/logs/
+
+  package:
+    stage: package
+    executor: docker
+    image: php:8.3-cli
+    cache:
+      key: composer-{{ hash "composer.lock" }}
+      paths:
+        - vendor
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install production dependencies
+        run: |
+          apt-get update && apt-get install -y unzip git libzip-dev zip
+          docker-php-ext-install zip
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+      - name: Remove dev/test files
+        run: |
+          rm -rf tests/ .env.testing phpunit.xml
+          rm -rf .git/ .github/ .gitignore
+          rm -rf node_modules/ storage/logs/*.log
+      - name: Create deployment archive
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          zip -r "release-${TIMESTAMP}.zip" . \
+            -x "*.git*" \
+            -x "tests/*" \
+            -x "node_modules/*" \
+            -x "storage/logs/*" \
+            -x ".env.testing"
+          echo "RELEASE_FILE=release-${TIMESTAMP}.zip" >> $FLOWFORGE_ENV
+      - name: Upload release artifact
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: laravel-release
+          path: release-*.zip
+
+  deploy:
+    stage: deploy
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download release artifact
+        uses: flowforge/download-artifact@v1
+        with:
+          name: laravel-release
+          path: ./
+      - name: Install SSH client
+        run: apk add --no-cache openssh-client rsync
+      - name: Deploy to VPS Nginx root
+        run: |
+          # Configure SSH
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          RELEASE_FILE=$(ls release-*.zip | head -1)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          RELEASE_DIR="${VPS_DEPLOY_PATH}/releases/${TIMESTAMP}"
+
+          echo "=== Deploying ${RELEASE_FILE} to ${VPS_HOST} ==="
+
+          # Upload the release archive
+          scp "$RELEASE_FILE" "${VPS_USER}@${VPS_HOST}:/tmp/${RELEASE_FILE}"
+
+          # Extract and set up on the VPS
+          ssh "${VPS_USER}@${VPS_HOST}" << 'DEPLOY_SCRIPT'
+            set -e
+
+            RELEASE_DIR="__RELEASE_DIR__"
+            DEPLOY_PATH="__DEPLOY_PATH__"
+            RELEASE_FILE="__RELEASE_FILE__"
+
+            # Create release directory
+            sudo mkdir -p "$RELEASE_DIR"
+
+            # Extract release
+            sudo unzip -o "/tmp/${RELEASE_FILE}" -d "$RELEASE_DIR"
+            sudo rm -f "/tmp/${RELEASE_FILE}"
+
+            # Set permissions
+            sudo chown -R www-data:www-data "$RELEASE_DIR"
+            sudo chmod -R 755 "$RELEASE_DIR"
+            sudo chmod -R 775 "$RELEASE_DIR/storage" "$RELEASE_DIR/bootstrap/cache"
+
+            # Copy shared storage (uploads, etc.) from current release
+            if [ -L "${DEPLOY_PATH}/current" ]; then
+              PREV=$(readlink -f "${DEPLOY_PATH}/current")
+              if [ -d "${PREV}/storage/app/public" ]; then
+                sudo cp -a "${PREV}/storage/app/public" "$RELEASE_DIR/storage/app/public"
+              fi
+            fi
+
+            # Symlink shared directories
+            sudo ln -nfs "${DEPLOY_PATH}/shared/.env" "${RELEASE_DIR}/.env"
+            sudo ln -nfs "${DEPLOY_PATH}/shared/storage/logs" "${RELEASE_DIR}/storage/logs"
+
+            # Switch the current symlink to the new release
+            sudo ln -nfs "$RELEASE_DIR" "${DEPLOY_PATH}/current"
+
+            echo "Release deployed to $RELEASE_DIR"
+          DEPLOY_SCRIPT
+
+          echo "=== Deployment complete ==="
+
+  migrate-database:
+    stage: post-deploy
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run database migrations on VPS
+        run: |
+          apk add --no-cache openssh-client
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "=== Running database migrations ==="
+          ssh "${VPS_USER}@${VPS_HOST}" << 'MIGRATE_SCRIPT'
+            set -e
+            cd __DEPLOY_PATH__/current
+
+            # Run migrations
+            sudo -u www-data php artisan migrate --force
+
+            # Clear and rebuild caches
+            sudo -u www-data php artisan config:cache
+            sudo -u www-data php artisan route:cache
+            sudo -u www-data php artisan view:cache
+
+            echo "Migrations complete"
+          MIGRATE_SCRIPT
+
+  update-env:
+    stage: post-deploy
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Update .env on VPS
+        run: |
+          apk add --no-cache openssh-client
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "=== Updating .env configuration ==="
+          ssh "${VPS_USER}@${VPS_HOST}" << 'ENV_SCRIPT'
+            set -e
+            ENV_FILE="__DEPLOY_PATH__/shared/.env"
+
+            # Update production environment values
+            sudo sed -i "s|^APP_ENV=.*|APP_ENV=production|" "$ENV_FILE"
+            sudo sed -i "s|^APP_DEBUG=.*|APP_DEBUG=false|" "$ENV_FILE"
+            sudo sed -i "s|^APP_URL=.*|APP_URL=${APP_URL}|" "$ENV_FILE"
+            sudo sed -i "s|^DB_HOST=.*|DB_HOST=${DB_HOST}|" "$ENV_FILE"
+            sudo sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${DB_DATABASE}|" "$ENV_FILE"
+            sudo sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${DB_USERNAME}|" "$ENV_FILE"
+            sudo sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASSWORD}|" "$ENV_FILE"
+
+            # Reload config cache
+            cd __DEPLOY_PATH__/current
+            sudo -u www-data php artisan config:cache
+
+            echo ".env updated"
+          ENV_SCRIPT
+
+  cleanup:
+    stage: cleanup
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Clean old releases on VPS
+        run: |
+          apk add --no-cache openssh-client
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "=== Cleaning up old releases ==="
+          ssh "${VPS_USER}@${VPS_HOST}" << 'CLEAN_SCRIPT'
+            set -e
+            RELEASES_DIR="__DEPLOY_PATH__/releases"
+            KEEP=5
+
+            # Keep only the latest N releases
+            cd "$RELEASES_DIR"
+            TOTAL=$(ls -1d */ 2>/dev/null | wc -l)
+            if [ "$TOTAL" -gt "$KEEP" ]; then
+              REMOVE=$((TOTAL - KEEP))
+              ls -1d */ | head -n "$REMOVE" | while read dir; do
+                echo "Removing old release: $dir"
+                sudo rm -rf "$dir"
+              done
+            fi
+
+            # Clear Laravel caches
+            cd __DEPLOY_PATH__/current
+            sudo -u www-data php artisan cache:clear
+            sudo -u www-data php artisan config:clear
+            sudo -u www-data php artisan view:clear
+
+            # Restart PHP-FPM to pick up new code
+            sudo systemctl reload php8.3-fpm || sudo systemctl reload php-fpm || true
+
+            # Reload Nginx
+            sudo nginx -t && sudo systemctl reload nginx
+
+            echo "Cleanup complete"
+          CLEAN_SCRIPT

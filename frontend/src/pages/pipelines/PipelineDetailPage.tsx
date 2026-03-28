@@ -13,7 +13,7 @@ import Input from '../../components/ui/Input';
 import { toast } from '../../components/ui/Toast';
 import PipelineBuilder from '../../components/pipeline/PipelineBuilder';
 import { api, ApiRequestError, type RunDetail } from '../../api/client';
-import type { Pipeline, PipelineRun, PipelineVersion, PipelineSchedule, PipelineLink, PipelineDAG, RunStatus } from '../../types';
+import type { Pipeline, PipelineRun, PipelineVersion, PipelineSchedule, PipelineLink, PipelineDAG, RunStatus, Environment, PipelineStageEnvironmentMapping, UpdateStageEnvironmentMappingRequest } from '../../types';
 import { formatRelativeTime, formatDuration, getStatusBadgeVariant, truncateCommitSha, describeCron, formatFutureRelativeTime, COMMON_TIMEZONES, copyToClipboard } from '../../utils/helpers';
 
 const statusLabel: Record<RunStatus, string> = {
@@ -124,6 +124,13 @@ const PipelineDetailPage: Component = () => {
 	const [pathFilters, setPathFilters] = createSignal('');
 	const [ignorePaths, setIgnorePaths] = createSignal('');
 	const [savingMonorepo, setSavingMonorepo] = createSignal(false);
+
+	// Stage→Environment mapping state
+	const [projectEnvs, setProjectEnvs] = createSignal<Environment[]>([]);
+	const [stageMappings, setStageMappings] = createSignal<PipelineStageEnvironmentMapping[]>([]);
+	const [stageMappingDraft, setStageMappingDraft] = createSignal<Record<string, string>>({});
+	const [loadingStageMappings, setLoadingStageMappings] = createSignal(false);
+	const [savingStageMappings, setSavingStageMappings] = createSignal(false);
 
 	// Update cron expression when builder values change
 	createEffect(() => {
@@ -649,6 +656,71 @@ const PipelineDetailPage: Component = () => {
 		}
 	};
 
+	// ---- Stage→Environment mapping handlers ----
+	const pipelineStages = (): string[] => {
+		const configContent = pipeline()?.config_content;
+		if (!configContent) return [];
+		try {
+			const spec = yaml.load(configContent) as Record<string, unknown> | null;
+			if (spec?.stages && typeof spec.stages === 'object') {
+				return Object.keys(spec.stages as Record<string, unknown>);
+			}
+		} catch { /* ignore */ }
+		return [];
+	};
+
+	const loadStageMappings = async () => {
+		setLoadingStageMappings(true);
+		try {
+			const [envs, mappings] = await Promise.all([
+				api.environments.list(params.id),
+				api.stageEnvironments.get(params.id, params.pid),
+			]);
+			setProjectEnvs(envs ?? []);
+			setStageMappings(mappings ?? []);
+			// Build draft from current mappings
+			const draft: Record<string, string> = {};
+			(mappings ?? []).forEach(m => { draft[m.stage_name] = m.environment_id; });
+			setStageMappingDraft(draft);
+		} catch {
+			setProjectEnvs([]);
+			setStageMappings([]);
+			setStageMappingDraft({});
+		} finally {
+			setLoadingStageMappings(false);
+		}
+	};
+
+	const updateStageMappingDraft = (stageName: string, envId: string) => {
+		setStageMappingDraft(prev => ({ ...prev, [stageName]: envId }));
+	};
+
+	const handleSaveStageMappings = async () => {
+		const draft = stageMappingDraft();
+		const mappings: UpdateStageEnvironmentMappingRequest[] = Object.entries(draft)
+			.filter(([_, envId]) => envId)
+			.map(([stage_name, environment_id]) => ({ stage_name, environment_id }));
+		setSavingStageMappings(true);
+		try {
+			await api.stageEnvironments.update(params.id, params.pid, mappings);
+			toast.success('Stage environment mappings saved');
+			loadStageMappings();
+		} catch (err) {
+			const msg = err instanceof ApiRequestError ? err.message : 'Failed to save stage mappings';
+			toast.error(msg);
+		} finally {
+			setSavingStageMappings(false);
+		}
+	};
+
+	const stageMappingsDirty = () => {
+		const draft = stageMappingDraft();
+		const current: Record<string, string> = {};
+		stageMappings().forEach(m => { current[m.stage_name] = m.environment_id; });
+		const stages = pipelineStages();
+		return stages.some(s => (draft[s] || '') !== (current[s] || ''));
+	};
+
 	const linkTypeLabel = (type: string) => {
 		switch (type) {
 			case 'trigger': return 'Trigger';
@@ -717,7 +789,7 @@ const PipelineDetailPage: Component = () => {
 
 			<Tabs tabs={tabs()} activeTab={activeTab()} onTabChange={(tab) => {
 				setActiveTab(tab);
-				if (tab === 'settings') syncSettings();
+				if (tab === 'settings') { syncSettings(); loadStageMappings(); }
 				if (tab === 'schedules') loadSchedules();
 				if (tab === 'composition') { loadLinks(); loadDAG(); }
 			}} class="mb-6" />
@@ -1262,6 +1334,86 @@ const PipelineDetailPage: Component = () => {
 									</div>
 									<Button onClick={handleSaveSettings} loading={saving()}>Save Changes</Button>
 								</div>
+							</Card>
+
+							{/* Stage→Environment Mappings */}
+							<Card title="Stage Environments" description="Map pipeline stages to deployment environments. Each stage can target a specific environment for deployment.">
+								<Show when={loadingStageMappings()}>
+									<div class="h-24 bg-[var(--color-bg-tertiary)] rounded-lg animate-pulse" />
+								</Show>
+								<Show when={!loadingStageMappings()}>
+									<Show when={pipelineStages().length > 0} fallback={
+										<div class="text-center py-6 text-[var(--color-text-tertiary)]">
+											<svg class="w-10 h-10 mx-auto mb-3 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+												<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
+											</svg>
+											<p class="text-sm">No stages found in pipeline configuration.</p>
+											<p class="text-xs mt-1">Define stages in the pipeline YAML to map them to environments.</p>
+										</div>
+									}>
+										<div class="space-y-4">
+											<Show when={projectEnvs().length === 0}>
+												<div class="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30">
+													<p class="text-xs text-amber-400">No environments configured for this project. Create environments first to map stages.</p>
+												</div>
+											</Show>
+											<div class="overflow-x-auto">
+												<table class="w-full text-sm">
+													<thead>
+														<tr class="border-b border-[var(--color-border-primary)]">
+															<th class="text-left px-3 py-2 text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">Stage</th>
+															<th class="text-left px-3 py-2 text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">Target Environment</th>
+														</tr>
+													</thead>
+													<tbody class="divide-y divide-[var(--color-border-primary)]">
+														<For each={pipelineStages()}>
+															{(stage) => (
+																<tr class="hover:bg-[var(--color-bg-hover)]">
+																	<td class="px-3 py-2.5">
+																		<div class="flex items-center gap-2">
+																			<span class="w-2 h-2 rounded-full bg-indigo-400" />
+																			<span class="text-sm font-medium text-[var(--color-text-primary)]">{stage}</span>
+																		</div>
+																	</td>
+																	<td class="px-3 py-2.5">
+																		<select
+																			class="w-full px-3 py-1.5 text-sm rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border-primary)] text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+																			value={stageMappingDraft()[stage] || ''}
+																			onChange={(e) => updateStageMappingDraft(stage, e.currentTarget.value)}
+																		>
+																			<option value="">— No environment —</option>
+																			<For each={projectEnvs()}>
+																				{(env) => (
+																					<option value={env.id}>{env.name}</option>
+																				)}
+																			</For>
+																		</select>
+																	</td>
+																</tr>
+															)}
+														</For>
+													</tbody>
+												</table>
+											</div>
+											<div class="flex items-center justify-between pt-2">
+												<Show when={stageMappingsDirty()}>
+													<span class="text-xs text-amber-400">Unsaved changes</span>
+												</Show>
+												<Show when={!stageMappingsDirty()}>
+													<span />
+												</Show>
+												<Button
+													size="sm"
+													onClick={handleSaveStageMappings}
+													loading={savingStageMappings()}
+													disabled={!stageMappingsDirty()}
+												>
+													Save Mappings
+												</Button>
+											</div>
+										</div>
+									</Show>
+								</Show>
 							</Card>
 
 							{/* Monorepo / Path Filters */}

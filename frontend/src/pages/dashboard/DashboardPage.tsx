@@ -10,6 +10,8 @@ import Modal from '../../components/ui/Modal';
 import { toast } from '../../components/ui/Toast';
 import { api } from '../../api/client';
 import { getEventSocket } from '../../api/websocket';
+import PipelineHealthChart from '../../components/dashboard/PipelineHealthChart';
+import AgentUtilizationChart from '../../components/dashboard/AgentUtilizationChart';
 import type { Project, Agent, PipelineRun, RunStatus, TriggerType, AgentStatus, SystemHealth, Deployment, Approval, DashboardWidgetConfig } from '../../types';
 import { formatDuration, formatRelativeTime, getStatusBgColor, getAgentStatusVariant } from '../../utils/helpers';
 
@@ -23,7 +25,7 @@ interface ActivityEvent { id: string; type: string; message: string; actor: stri
 // ---------------------------------------------------------------------------
 // Default widget definitions
 // ---------------------------------------------------------------------------
-type WidgetId = 'stats' | 'recent_runs' | 'recent_deployments' | 'pending_approvals' | 'agent_status' | 'quick_actions' | 'pipeline_health' | 'activity_feed';
+type WidgetId = 'stats' | 'recent_runs' | 'recent_deployments' | 'pending_approvals' | 'agent_status' | 'quick_actions' | 'pipeline_health' | 'pipeline_charts' | 'agent_charts' | 'activity_feed';
 
 interface WidgetDef {
 	id: WidgetId;
@@ -35,6 +37,8 @@ interface WidgetDef {
 const WIDGET_DEFS: WidgetDef[] = [
 	{ id: 'stats', label: 'Stats Overview', description: 'Total pipelines, runs, success rate, and more', defaultSize: 'full' },
 	{ id: 'recent_runs', label: 'Recent Runs', description: 'Latest pipeline executions', defaultSize: 'full' },
+	{ id: 'pipeline_charts', label: 'Pipeline Trends', description: 'Pass/fail rates and build trend charts', defaultSize: 'half' },
+	{ id: 'agent_charts', label: 'Agent Utilization', description: 'CPU, memory, and queue depth charts', defaultSize: 'half' },
 	{ id: 'recent_deployments', label: 'Recent Deployments', description: 'Latest deployments across environments', defaultSize: 'full' },
 	{ id: 'pending_approvals', label: 'Pending Approvals', description: 'Approval requests awaiting response', defaultSize: 'full' },
 	{ id: 'agent_status', label: 'Agent Status', description: 'Online/offline/busy agent counts', defaultSize: 'half' },
@@ -167,7 +171,28 @@ async function fetchDashboardData() {
 		pendingApprovals = await api.approvals.listPending();
 	} catch { /* approvals endpoint may not be available */ }
 
-	return { stats, runs: recentRuns.slice(0, 10), agents, health, projects, recentDeployments, pendingApprovals, pipelineHealth };
+	// Build pipeline health chart data from recent runs (group by date)
+	const healthChartData: { date: string; success: number; failure: number; cancelled: number }[] = [];
+	const runsByDate = new Map<string, { success: number; failure: number; cancelled: number }>();
+	for (const run of recentRuns) {
+		const date = new Date(run.created_at).toISOString().slice(0, 10);
+		if (!runsByDate.has(date)) runsByDate.set(date, { success: 0, failure: 0, cancelled: 0 });
+		const entry = runsByDate.get(date)!;
+		if (run.status === 'success') entry.success++;
+		else if (run.status === 'failure') entry.failure++;
+		else if (run.status === 'cancelled') entry.cancelled++;
+	}
+	for (const [date, counts] of [...runsByDate.entries()].sort()) {
+		healthChartData.push({ date, ...counts });
+	}
+
+	// Fetch agent utilization metrics
+	let agentMetrics: { timestamp: string; cpu_percent: number; memory_percent: number; queue_depth: number }[] = [];
+	try {
+		agentMetrics = await api.agentMetrics.utilization();
+	} catch { /* agent metrics may not be available */ }
+
+	return { stats, runs: recentRuns.slice(0, 10), agents, health, projects, recentDeployments, pendingApprovals, pipelineHealth, healthChartData, agentMetrics };
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +317,11 @@ const DashboardPage: Component = () => {
 	// Render widget by ID
 	const renderWidget = (widgetId: string, size: 'full' | 'half') => {
 		const sizeClass = size === 'full' ? 'col-span-full' : 'col-span-1';
+
+		// Chart widgets
+		if (widgetId === 'pipeline_charts' || widgetId === 'agent_charts') {
+			return renderChartWidget(widgetId, sizeClass);
+		}
 
 		switch (widgetId) {
 			case 'stats':
@@ -514,6 +544,47 @@ const DashboardPage: Component = () => {
 			default:
 				return null;
 		}
+	};
+
+	// Chart widgets rendered outside the switch to keep code organized
+	const renderChartWidget = (widgetId: string, sizeClass: string) => {
+		if (widgetId === 'pipeline_charts') {
+			return (
+				<div class={`${sizeClass}`}>
+					<Card title="Pipeline Trends" description="Build pass/fail rates over time">
+						<Show when={!data.loading} fallback={
+							<div class="h-[250px] flex items-center justify-center">
+								<div class="animate-pulse text-sm text-[var(--color-text-tertiary)]">Loading charts...</div>
+							</div>
+						}>
+							<PipelineHealthChart data={data()?.healthChartData ?? []} />
+						</Show>
+					</Card>
+				</div>
+			);
+		}
+		if (widgetId === 'agent_charts') {
+			const agents = () => data()?.agents ?? [];
+			return (
+				<div class={`${sizeClass}`}>
+					<Card title="Agent Utilization" description="Resource usage and queue depth" actions={<A href="/agents" class="text-xs text-indigo-400 hover:text-indigo-300">Manage</A>}>
+						<Show when={!data.loading} fallback={
+							<div class="h-[250px] flex items-center justify-center">
+								<div class="animate-pulse text-sm text-[var(--color-text-tertiary)]">Loading charts...</div>
+							</div>
+						}>
+							<AgentUtilizationChart
+								data={data()?.agentMetrics ?? []}
+								totalAgents={agents().length}
+								onlineAgents={agents().filter(a => a.status === 'online' || a.status === 'busy').length}
+								busyAgents={agents().filter(a => a.status === 'busy').length}
+							/>
+						</Show>
+					</Card>
+				</div>
+			);
+		}
+		return null;
 	};
 
 	return (

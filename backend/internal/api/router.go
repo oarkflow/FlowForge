@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 
 	"github.com/gofiber/fiber/v3"
@@ -107,6 +108,40 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	secrets.Post("/", middleware.RequireAdmin(), h.CreateSecret)
 	secrets.Put("/:secretId", middleware.RequireAdmin(), h.UpdateSecret)
 	secrets.Delete("/:secretId", middleware.RequireAdmin(), h.DeleteSecret)
+	secrets.Put("/:secretId/rotation", middleware.RequireAdmin(), h.SetSecretRotationPolicy)
+	secrets.Post("/:secretId/rotate", middleware.RequireAdmin(), h.MarkSecretRotated)
+	secrets.Get("/rotation-status", middleware.RequireDev(), h.ListRotationStatus)
+
+	// Secret Providers (external: Vault, AWS, GCP)
+	secretProviders := projects.Group("/:id/secret-providers")
+	secretProviders.Get("/", middleware.RequireDev(), h.ListSecretProviders)
+	secretProviders.Post("/", middleware.RequireAdmin(), h.CreateSecretProvider)
+	secretProviders.Put("/:spid", middleware.RequireAdmin(), h.UpdateSecretProvider)
+	secretProviders.Delete("/:spid", middleware.RequireAdmin(), h.DeleteSecretProvider)
+	secretProviders.Get("/health", middleware.RequireDev(), h.GetSecretProviderHealth)
+
+	// Project IP Allowlist
+	projectIPAllowlist := projects.Group("/:id/ip-allowlist")
+	projectIPAllowlist.Get("/", middleware.RequireAdmin(), h.ListIPAllowlist)
+	projectIPAllowlist.Post("/", middleware.RequireAdmin(), h.CreateIPAllowlistEntry)
+	projectIPAllowlist.Delete("/:entryId", middleware.RequireAdmin(), h.DeleteIPAllowlistEntry)
+
+	// Project Deployment Providers
+	deploymentProviders := projects.Group("/:id/deployment-providers")
+	deploymentProviders.Get("/", middleware.RequireDev(), h.ListDeploymentProviders)
+	deploymentProviders.Post("/", middleware.RequireAdmin(), h.CreateDeploymentProvider)
+	deploymentProviders.Put("/:dpid", middleware.RequireAdmin(), h.UpdateDeploymentProvider)
+	deploymentProviders.Delete("/:dpid", middleware.RequireAdmin(), h.DeleteDeploymentProvider)
+	deploymentProviders.Post("/:dpid/test", middleware.RequireDev(), h.TestDeploymentProvider)
+
+	// Project Environment Chain
+	environmentChain := projects.Group("/:id/environment-chain")
+	environmentChain.Get("/", middleware.RequireDev(), h.GetEnvironmentChain)
+	environmentChain.Put("/", middleware.RequireDev(), h.UpdateEnvironmentChain)
+
+	// Pipeline Stage -> Environment mappings
+	projects.Get("/:id/pipelines/:pid/stage-environments", middleware.RequireDev(), h.GetPipelineStageEnvironmentMappings)
+	projects.Put("/:id/pipelines/:pid/stage-environments", middleware.RequireDev(), h.UpdatePipelineStageEnvironmentMappings)
 
 	// Environment Variables
 	envVars := projects.Group("/:id/env-vars")
@@ -252,14 +287,63 @@ func RegisterRoutes(app *fiber.App, db *sqlx.DB, cfg *config.Config, imp *import
 	scaling.Get("/events", h.ListRecentScalingEvents)
 	scaling.Get("/metrics", h.GetScalingMetrics)
 
-	// Webhooks (unauthenticated, signature-validated)
-	webhooks := app.Group("/webhooks")
+	// Global IP Allowlist management (admin only)
+	ipAllowlist := protected.Group("/ip-allowlist")
+	ipAllowlist.Get("/", middleware.RequireAdmin(), h.ListGlobalIPAllowlist)
+	ipAllowlist.Post("/", middleware.RequireAdmin(), h.CreateIPAllowlistEntry)
+	ipAllowlist.Delete("/:entryId", middleware.RequireAdmin(), h.DeleteIPAllowlistEntry)
+
+	// Secret scanning
+	protected.Post("/security/scan-secrets", middleware.RequireAdmin(), h.ScanRepositoryForSecrets)
+	protected.Post("/security/scan-text", middleware.RequireAdmin(), h.ScanTextForSecrets)
+
+	// Overdue secret rotation (global view, admin only)
+	protected.Get("/security/rotation/overdue", middleware.RequireAdmin(), h.ListOverdueSecrets)
+
+	// IP allowlist for webhook endpoints
+	ipAllow := middleware.NewIPAllowlist(db)
+	_ = ipAllow.Reload(context.Background())
+
+	// Webhooks (unauthenticated, signature-validated, IP allowlist enforced)
+	webhooks := app.Group("/webhooks", ipAllow.CheckGlobal())
 	webhooks.Post("/github", h.GithubWebhook)
 	webhooks.Post("/gitlab", h.GitlabWebhook)
 	webhooks.Post("/bitbucket", h.BitbucketWebhook)
 
 	// Public badge endpoint (no auth — for embedding in READMEs)
 	api.Get("/badges/pipeline/:id", h.GetPipelineBadge)
+
+	// OpenAPI spec
+	api.Get("/openapi.json", OpenAPISpec())
+
+	// Templates (public listing, auth for create/update/delete)
+	templateRoutes := api.Group("/templates")
+	templateRoutes.Get("/", h.ListTemplates)
+	templateRoutes.Get("/:id", h.GetTemplate)
+	templateRoutes.Post("/", middleware.Auth(cfg.JWTSecret), middleware.RequireDev(), h.CreateTemplate)
+	templateRoutes.Put("/:id", middleware.Auth(cfg.JWTSecret), middleware.RequireDev(), h.UpdateTemplate)
+	templateRoutes.Delete("/:id", middleware.Auth(cfg.JWTSecret), middleware.RequireAdmin(), h.DeleteTemplate)
+
+	// Security scan results
+	protected.Get("/runs/:rid/security", h.GetRunSecurityResults)
+
+	// Admin routes
+	adminRoutes := protected.Group("/admin", middleware.RequireAdmin())
+
+	// Feature Flags
+	adminRoutes.Get("/features", h.ListFeatureFlags)
+	adminRoutes.Post("/features", h.CreateFeatureFlag)
+	adminRoutes.Put("/features/:id", h.UpdateFeatureFlag)
+
+	// Dead-Letter Queue
+	adminRoutes.Get("/dlq", h.ListDLQ)
+	adminRoutes.Post("/dlq/:id/retry", h.RetryDLQ)
+	adminRoutes.Delete("/dlq/:id", h.PurgeDLQ)
+
+	// Backup & Restore
+	adminRoutes.Post("/backup", h.CreateBackup)
+	adminRoutes.Get("/backups", h.ListBackups)
+	adminRoutes.Post("/restore", h.RestoreBackup)
 
 	// Agent communication endpoints (unauthenticated — token validated by agent server)
 	agentComm := api.Group("/agents")

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -496,4 +497,122 @@ func EncodeRegistryAuth(username, password string) string {
 	}
 	data, _ := json.Marshal(auth)
 	return base64.URLEncoding.EncodeToString(data)
+}
+
+// BuildWithBuildKit runs a Docker build with BuildKit enabled, supporting
+// cache-from/cache-to and multi-arch builds via docker buildx.
+func (e *DockerExecutor) BuildWithBuildKit(ctx context.Context, opts BuildKitOptions, logWriter LogWriter) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Build command args
+	args := []string{"build"}
+
+	// Tags
+	for _, tag := range opts.Tags {
+		args = append(args, "-t", tag)
+	}
+
+	// Dockerfile
+	if opts.Dockerfile != "" {
+		args = append(args, "-f", opts.Dockerfile)
+	}
+
+	// Cache from
+	for _, cf := range opts.CacheFrom {
+		args = append(args, "--cache-from", cf)
+	}
+
+	// Cache to
+	if opts.CacheTo != "" {
+		args = append(args, "--cache-to", opts.CacheTo)
+	}
+
+	// Build args
+	for k, v := range opts.BuildArgs {
+		args = append(args, "--build-arg", k+"="+v)
+	}
+
+	// Push
+	if opts.Push {
+		args = append(args, "--push")
+	}
+
+	// Context
+	if opts.ContextDir == "" {
+		opts.ContextDir = "."
+	}
+	args = append(args, opts.ContextDir)
+
+	// Use buildx for multi-arch builds
+	if len(opts.Platforms) > 0 {
+		platforms := strings.Join(opts.Platforms, ",")
+
+		// Create buildx builder if needed
+		createCmd := exec.CommandContext(ctx, "docker", "buildx", "create", "--use", "--name", "flowforge-builder")
+		createCmd.Env = append(createCmd.Environ(), "DOCKER_BUILDKIT=1")
+		_ = createCmd.Run() // Ignore error if builder already exists
+
+		buildxArgs := []string{"buildx", "build", "--platform", platforms}
+		buildxArgs = append(buildxArgs, args[1:]...) // Skip the initial "build"
+
+		cmd := exec.CommandContext(ctx, "docker", buildxArgs...)
+		cmd.Env = append(cmd.Environ(), "DOCKER_BUILDKIT=1")
+		return e.runBuildCommand(ctx, cmd, logWriter)
+	}
+
+	// Standard BuildKit build
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Env = append(cmd.Environ(), "DOCKER_BUILDKIT=1")
+	return e.runBuildCommand(ctx, cmd, logWriter)
+}
+
+func (e *DockerExecutor) runBuildCommand(ctx context.Context, cmd *exec.Cmd, logWriter LogWriter) error {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("build: stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("build: stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("build: start: %w", err)
+	}
+
+	// Stream output
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if logWriter != nil {
+				logWriter("stdout", append(scanner.Bytes(), '\n'))
+			}
+		}
+	}()
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			if logWriter != nil {
+				logWriter("stderr", append(scanner.Bytes(), '\n'))
+			}
+		}
+	}()
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+	return nil
+}
+
+// BuildKitOptions holds options for BuildKit-based Docker builds.
+type BuildKitOptions struct {
+	Tags       []string          // Image tags
+	Dockerfile string            // Path to Dockerfile
+	ContextDir string            // Build context directory
+	Platforms  []string          // e.g. ["linux/amd64", "linux/arm64"]
+	CacheFrom  []string          // Cache sources
+	CacheTo    string            // Cache export destination
+	BuildArgs  map[string]string // Build arguments
+	Push       bool              // Push after building
 }

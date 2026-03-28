@@ -13,6 +13,7 @@ import Table, { type TableColumn } from '../../components/ui/Table';
 import KeyValueEditor, { type KeyValuePair } from '../../components/ui/KeyValueEditor';
 import EnvironmentsTab from '../../components/environments/EnvironmentsTab';
 import RegistriesTab from '../../components/registries/RegistriesTab';
+import DeploymentProvidersTab from '../../components/providers/DeploymentProvidersTab';
 import { toast } from '../../components/ui/Toast';
 import { api, ApiRequestError } from '../../api/client';
 import type { Pipeline, PipelineRun, Repository, Secret, EnvVar, NotificationChannel, RunStatus } from '../../types';
@@ -263,6 +264,7 @@ const ProjectDetailPage: Component = () => {
 		{ id: 'pipelines', label: `Pipelines (${data()?.pipelines?.length ?? 0})` },
 		{ id: 'environments', label: 'Environments' },
 		{ id: 'registries', label: 'Registries' },
+		{ id: 'providers', label: 'Deployment Providers' },
 		{ id: 'runs', label: 'Runs' },
 		{ id: 'repositories', label: 'Repositories' },
 		{ id: 'environment', label: `Environment (${data()?.envVars?.length ?? 0})` },
@@ -512,6 +514,11 @@ const ProjectDetailPage: Component = () => {
 					{/* Registries */}
 					<Match when={activeTab() === 'registries'}>
 						<RegistriesTab projectId={params.id} />
+					</Match>
+
+					{/* Deployment Providers */}
+					<Match when={activeTab() === 'providers'}>
+						<DeploymentProvidersTab projectId={params.id} />
 					</Match>
 
 					{/* Repositories */}

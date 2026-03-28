@@ -488,6 +488,20 @@ func (h *Handler) PromoteDeployment(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "source and target environments must belong to the same project")
 	}
 
+	chainEdges, err := h.repo.EnvironmentChain.ListByProject(c.Context(), targetEnv.ProjectID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to validate promotion chain")
+	}
+	if len(chainEdges) > 0 {
+		allowed, err := h.repo.EnvironmentChain.IsPromotionAllowed(c.Context(), targetEnv.ProjectID, input.SourceEnvID, envID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "failed to validate promotion chain")
+		}
+		if !allowed {
+			return fiber.NewError(fiber.StatusForbidden, "promotion not allowed by project environment chain")
+		}
+	}
+
 	sourceDep, err := h.repo.Deployments.GetByID(c.Context(), *sourceEnv.CurrentDeploymentID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "source deployment not found")

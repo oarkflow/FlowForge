@@ -680,3 +680,84 @@ export interface SearchResults {
 	pipelines: Pipeline[];
 	runs: PipelineRun[];
 }
+
+// --- Deployment Provider ---
+export type DeploymentProviderType = 'aws' | 'gcp' | 'azure' | 'digitalocean' | 'custom';
+
+export interface ProjectDeploymentProvider {
+	id: string;
+	project_id: string;
+	name: string;
+	provider_type: string;
+	config: Record<string, any>;
+	is_active: boolean;
+	is_default: boolean;
+	capabilities: string;
+	created_by: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface AWSProviderConfig {
+	region: string;
+	auth_mode: 'access_key' | 'assume_role' | 'default';
+	access_key_id?: string;
+	secret_access_key?: string;
+	role_arn?: string;
+	external_id?: string;
+	session_name?: string;
+}
+
+export interface CreateDeploymentProviderRequest {
+	name: string;
+	provider_type: string;
+	config: Record<string, any>;
+	is_active?: boolean;
+}
+
+export interface UpdateDeploymentProviderRequest {
+	name?: string;
+	provider_type?: string;
+	config?: Record<string, any>;
+	is_active?: boolean;
+}
+
+export interface TestDeploymentProviderResponse {
+	success: boolean;
+	message: string;
+}
+
+// --- Environment Chain ---
+export interface ProjectEnvironmentChainEdge {
+	id: string;
+	project_id: string;
+	source_environment_id: string;
+	target_environment_id: string;
+	position: number;
+	is_enabled: boolean;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface UpdateEnvironmentChainRequest {
+	source_environment_id: string;
+	target_environment_id: string;
+	position?: number;
+}
+
+// --- Pipeline Stage→Environment Mapping ---
+export interface PipelineStageEnvironmentMapping {
+	id: string;
+	project_id: string;
+	pipeline_id: string;
+	stage_name: string;
+	environment_id: string;
+	promotion_source_stage: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface UpdateStageEnvironmentMappingRequest {
+	stage_name: string;
+	environment_id: string;
+}

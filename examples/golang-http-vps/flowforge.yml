@@ -1,0 +1,422 @@
+# ==============================================================================
+# Golang HTTP Server — Full CI/CD Pipeline
+# Build frontend, move dist, dependency, build, test, move migrations + email
+# templates, deploy to VPS Nginx root, migrate database, clean, update .env
+# ==============================================================================
+
+version: "1"
+name: "Go HTTP Server — VPS Deploy"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+defaults:
+  executor: docker
+  image: golang:1.22-alpine
+  timeout: 30m
+
+env:
+  CGO_ENABLED: "0"
+  GOOS: "linux"
+  GOARCH: "amd64"
+  APP_ENV: "production"
+  VPS_HOST: "${VPS_HOST}"
+  VPS_USER: "${VPS_USER}"
+  VPS_DEPLOY_PATH: "/opt/goapp"
+  DB_HOST: "${DB_HOST}"
+  DB_DATABASE: "${DB_DATABASE}"
+  DB_USERNAME: "${DB_USERNAME}"
+  DB_PASSWORD: "${DB_PASSWORD}"
+
+stages:
+  - build-frontend
+  - prepare
+  - test
+  - build
+  - package
+  - deploy
+  - post-deploy
+  - cleanup
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Stage 1: Build the frontend (e.g. React/Vue/Svelte SPA)
+  # --------------------------------------------------------------------------
+  build-frontend:
+    stage: build-frontend
+    executor: docker
+    image: node:20-alpine
+    cache:
+      key: node-modules-{{ hash "frontend/package-lock.json" }}
+      paths:
+        - frontend/node_modules
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+      - name: Build frontend
+        run: cd frontend && npm run build
+      - name: Upload frontend dist
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+  # --------------------------------------------------------------------------
+  # Stage 2: Prepare — move frontend dist and resources into Go project root
+  # --------------------------------------------------------------------------
+  move-assets:
+    stage: prepare
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download frontend dist
+        uses: flowforge/download-artifact@v1
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+      - name: Move frontend dist to Go project root
+        run: |
+          mkdir -p static/
+          cp -r frontend/dist/* static/
+          echo "Frontend assets moved to static/"
+          ls -la static/
+      - name: Move migration files to Go project root
+        run: |
+          mkdir -p dist-migrations/
+          cp -r migrations/* dist-migrations/
+          echo "Migration files moved to dist-migrations/"
+          ls -la dist-migrations/
+      - name: Move email templates to Go project root
+        run: |
+          mkdir -p dist-templates/email/
+          cp -r templates/email/* dist-templates/email/
+          echo "Email templates moved to dist-templates/email/"
+          ls -la dist-templates/email/
+      - name: Upload prepared workspace
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: prepared-workspace
+          path: ./
+
+  # --------------------------------------------------------------------------
+  # Stage 3: Go dependency resolution and test
+  # --------------------------------------------------------------------------
+  test:
+    stage: test
+    executor: docker
+    image: golang:1.22-alpine
+    cache:
+      key: go-mod-{{ hash "go.sum" }}
+      paths:
+        - /go/pkg/mod
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install Go dependencies
+        run: go mod download && go mod verify
+      - name: Run Go vet
+        run: go vet ./...
+      - name: Run tests with coverage
+        run: go test -race -coverprofile=coverage.out -timeout 10m ./...
+      - name: Upload coverage
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: coverage-report
+          path: coverage.out
+
+  # --------------------------------------------------------------------------
+  # Stage 4: Build the Go binary with embedded static files
+  # --------------------------------------------------------------------------
+  build:
+    stage: build
+    executor: docker
+    image: golang:1.22-alpine
+    cache:
+      key: go-mod-{{ hash "go.sum" }}
+      paths:
+        - /go/pkg/mod
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download prepared workspace
+        uses: flowforge/download-artifact@v1
+        with:
+          name: prepared-workspace
+          path: ./
+      - name: Install Go dependencies
+        run: go mod download
+      - name: Build Go binary
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          go build \
+            -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+            -o dist/server \
+            ./cmd/server
+          chmod +x dist/server
+          echo "Binary built: dist/server"
+          ls -lh dist/server
+      - name: Upload build artifacts
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: go-build
+          path: dist/
+
+  # --------------------------------------------------------------------------
+  # Stage 5: Package everything for deployment
+  # --------------------------------------------------------------------------
+  package:
+    stage: package
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download build artifacts
+        uses: flowforge/download-artifact@v1
+        with:
+          name: go-build
+          path: dist/
+      - name: Download prepared workspace
+        uses: flowforge/download-artifact@v1
+        with:
+          name: prepared-workspace
+          path: workspace/
+      - name: Create deployment package
+        run: |
+          apk add --no-cache tar gzip
+
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          RELEASE_DIR="release-${TIMESTAMP}"
+          mkdir -p "$RELEASE_DIR"
+
+          # Copy Go binary
+          cp dist/server "$RELEASE_DIR/"
+
+          # Copy static assets (frontend dist embedded at build time, but also deploy separately for Nginx)
+          cp -r workspace/static/ "$RELEASE_DIR/static/" 2>/dev/null || true
+
+          # Copy migration files
+          cp -r workspace/dist-migrations/ "$RELEASE_DIR/migrations/" 2>/dev/null || true
+
+          # Copy email templates
+          cp -r workspace/dist-templates/ "$RELEASE_DIR/templates/" 2>/dev/null || true
+
+          # Copy .env.example
+          cp workspace/.env.example "$RELEASE_DIR/" 2>/dev/null || true
+
+          # Create tarball
+          tar -czf "release-${TIMESTAMP}.tar.gz" "$RELEASE_DIR"
+          echo "RELEASE_FILE=release-${TIMESTAMP}.tar.gz" >> $FLOWFORGE_ENV
+          echo "Package created: release-${TIMESTAMP}.tar.gz"
+          ls -lh "release-${TIMESTAMP}.tar.gz"
+      - name: Upload release
+        uses: flowforge/upload-artifact@v1
+        with:
+          name: go-release
+          path: release-*.tar.gz
+
+  # --------------------------------------------------------------------------
+  # Stage 6: Deploy to VPS
+  # --------------------------------------------------------------------------
+  deploy:
+    stage: deploy
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Download release
+        uses: flowforge/download-artifact@v1
+        with:
+          name: go-release
+          path: ./
+      - name: Install SSH client
+        run: apk add --no-cache openssh-client tar gzip
+      - name: Deploy to VPS
+        run: |
+          # Configure SSH
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          RELEASE_FILE=$(ls release-*.tar.gz | head -1)
+          TIMESTAMP=$(echo "$RELEASE_FILE" | grep -oP '\d{14}')
+
+          echo "=== Deploying ${RELEASE_FILE} to ${VPS_HOST} ==="
+
+          # Upload the release
+          scp "$RELEASE_FILE" "${VPS_USER}@${VPS_HOST}:/tmp/${RELEASE_FILE}"
+
+          # Extract and deploy on the VPS
+          ssh "${VPS_USER}@${VPS_HOST}" << DEPLOY_SCRIPT
+            set -e
+
+            DEPLOY_PATH="${VPS_DEPLOY_PATH}"
+            RELEASE_DIR="\${DEPLOY_PATH}/releases/${TIMESTAMP}"
+
+            # Create release directory
+            sudo mkdir -p "\$RELEASE_DIR"
+
+            # Extract release
+            sudo tar -xzf "/tmp/${RELEASE_FILE}" -C "\$RELEASE_DIR" --strip-components=1
+            sudo rm -f "/tmp/${RELEASE_FILE}"
+
+            # Set permissions
+            sudo chown -R goapp:goapp "\$RELEASE_DIR"
+            sudo chmod +x "\$RELEASE_DIR/server"
+
+            # Copy static files to Nginx root for direct serving
+            if [ -d "\$RELEASE_DIR/static" ]; then
+              sudo mkdir -p /var/www/goapp/static
+              sudo cp -r "\$RELEASE_DIR/static/"* /var/www/goapp/static/
+              sudo chown -R www-data:www-data /var/www/goapp/static
+            fi
+
+            # Symlink shared .env
+            sudo ln -nfs "\${DEPLOY_PATH}/shared/.env" "\${RELEASE_DIR}/.env"
+
+            # Switch the current symlink
+            sudo ln -nfs "\$RELEASE_DIR" "\${DEPLOY_PATH}/current"
+
+            # Restart the Go service via systemd
+            sudo systemctl restart goapp
+
+            # Verify the service is running
+            sleep 3
+            if systemctl is-active --quiet goapp; then
+              echo "Service goapp is running"
+            else
+              echo "Error: Service failed to start"
+              sudo journalctl -u goapp --no-pager -n 20
+              exit 1
+            fi
+
+            echo "Release deployed to \$RELEASE_DIR"
+          DEPLOY_SCRIPT
+
+          echo "=== Deployment complete ==="
+
+  # --------------------------------------------------------------------------
+  # Stage 7: Post-deploy — migrate database and update .env
+  # --------------------------------------------------------------------------
+  migrate-database:
+    stage: post-deploy
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run database migrations on VPS
+        run: |
+          apk add --no-cache openssh-client
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "=== Running database migrations ==="
+          ssh "${VPS_USER}@${VPS_HOST}" << MIGRATE_SCRIPT
+            set -e
+            cd ${VPS_DEPLOY_PATH}/current
+
+            # Run migrations using the Go binary's migrate subcommand
+            # (or use a standalone migration tool like golang-migrate)
+            if [ -f ./server ]; then
+              ./server migrate up 2>&1 || {
+                echo "Trying golang-migrate CLI fallback..."
+                migrate -path ./migrations -database "\$DATABASE_URL" up
+              }
+            fi
+
+            echo "Migrations complete"
+          MIGRATE_SCRIPT
+
+  update-env:
+    stage: post-deploy
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Update .env on VPS
+        run: |
+          apk add --no-cache openssh-client
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "=== Updating .env configuration ==="
+          ssh "${VPS_USER}@${VPS_HOST}" << ENV_SCRIPT
+            set -e
+            ENV_FILE="${VPS_DEPLOY_PATH}/shared/.env"
+
+            # Update production environment values
+            sudo sed -i "s|^APP_ENV=.*|APP_ENV=production|" "\$ENV_FILE"
+            sudo sed -i "s|^DB_HOST=.*|DB_HOST=${DB_HOST}|" "\$ENV_FILE"
+            sudo sed -i "s|^DB_NAME=.*|DB_NAME=${DB_DATABASE}|" "\$ENV_FILE"
+            sudo sed -i "s|^DB_USER=.*|DB_USER=${DB_USERNAME}|" "\$ENV_FILE"
+            sudo sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASSWORD}|" "\$ENV_FILE"
+            sudo sed -i "s|^SERVER_PORT=.*|SERVER_PORT=8080|" "\$ENV_FILE"
+            sudo sed -i "s|^SMTP_HOST=.*|SMTP_HOST=${SMTP_HOST}|" "\$ENV_FILE"
+            sudo sed -i "s|^SMTP_PORT=.*|SMTP_PORT=${SMTP_PORT}|" "\$ENV_FILE"
+
+            # Restart to pick up .env changes
+            sudo systemctl restart goapp
+
+            echo ".env updated and service restarted"
+          ENV_SCRIPT
+
+  # --------------------------------------------------------------------------
+  # Stage 8: Cleanup old releases
+  # --------------------------------------------------------------------------
+  cleanup:
+    stage: cleanup
+    executor: docker
+    image: alpine:latest
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Clean old releases on VPS
+        run: |
+          apk add --no-cache openssh-client
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "=== Cleaning up old releases ==="
+          ssh "${VPS_USER}@${VPS_HOST}" << CLEAN_SCRIPT
+            set -e
+            RELEASES_DIR="${VPS_DEPLOY_PATH}/releases"
+            KEEP=5
+
+            # Keep only the latest N releases
+            cd "\$RELEASES_DIR"
+            TOTAL=\$(ls -1d */ 2>/dev/null | wc -l)
+            if [ "\$TOTAL" -gt "\$KEEP" ]; then
+              REMOVE=\$((\$TOTAL - \$KEEP))
+              ls -1d */ | head -n "\$REMOVE" | while read dir; do
+                echo "Removing old release: \$dir"
+                sudo rm -rf "\$dir"
+              done
+            fi
+
+            # Clear old Nginx cache if any
+            sudo nginx -t && sudo systemctl reload nginx
+
+            echo "Cleanup complete"
+          CLEAN_SCRIPT

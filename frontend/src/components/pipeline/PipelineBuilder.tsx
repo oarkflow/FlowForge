@@ -1,10 +1,12 @@
 import type { Component } from 'solid-js';
-import { createSignal, createResource, For, Show, onMount } from 'solid-js';
+import { createSignal, createResource, For, Show, onMount, lazy } from 'solid-js';
 import * as yaml from 'js-yaml';
 import Button from '../ui/Button';
 import KeyValueEditor, { type KeyValuePair } from '../ui/KeyValueEditor';
 import { api } from '../../api/client';
 import type { EnvVar, Secret } from '../../types';
+
+const MonacoYamlEditor = lazy(() => import('./MonacoYamlEditor'));
 
 // ---------------------------------------------------------------------------
 // Builder data model
@@ -647,16 +649,11 @@ const PipelineBuilder: Component<PipelineBuilderProps> = (props) => {
 
 			{/* YAML View */}
 			<Show when={viewMode() === 'yaml'}>
-				<div class="rounded-xl border border-[var(--color-border-primary)] overflow-hidden">
-					<textarea
-						value={yamlEditContent()}
-						onInput={(e) => { setYamlEditContent(e.currentTarget.value); markDirty(); }}
-						onKeyDown={handleTabKey}
-						class="w-full h-[600px] px-4 py-3 text-sm font-mono bg-[var(--color-bg-primary)] text-[var(--color-text-primary)] placeholder-[var(--color-text-tertiary)] focus:outline-none resize-y border-none"
-						placeholder="# FlowForge Pipeline Configuration (YAML)"
-						spellcheck={false}
-					/>
-				</div>
+				<MonacoYamlEditor
+					value={yamlEditContent()}
+					onChange={(val) => { setYamlEditContent(val); markDirty(); }}
+					height="600px"
+				/>
 			</Show>
 
 			{/* Builder View */}

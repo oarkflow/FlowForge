@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { createSignal, createResource, For, Show, onMount, onCleanup, createEffect } from 'solid-js';
+import { createSignal, createResource, For, Show, onMount, onCleanup, createEffect, lazy, Suspense } from 'solid-js';
 import { useParams, A, useNavigate } from '@solidjs/router';
 import Badge from '../../components/ui/Badge';
 import Button from '../../components/ui/Button';
@@ -8,6 +8,10 @@ import { api, ApiRequestError, type RunDetail } from '../../api/client';
 import { createRunLogSocket } from '../../api/websocket';
 import type { RunStatus, Artifact, LogLine } from '../../types';
 import { formatDuration, formatRelativeTime, getStatusBadgeVariant, truncateCommitSha, formatBytes } from '../../utils/helpers';
+
+const TestResults = lazy(() => import('../../components/runs/TestResults'));
+const CoverageReport = lazy(() => import('../../components/runs/CoverageReport'));
+const ResourceGraph = lazy(() => import('../../components/runs/ResourceGraph'));
 
 // ---------------------------------------------------------------------------
 // Status icon
@@ -176,6 +180,7 @@ const RunDetailPage: Component = () => {
 	const [rerunning, setRerunning] = createSignal(false);
 	const [approving, setApproving] = createSignal(false);
 	const [liveLogLines, setLiveLogLines] = createSignal<LogEntry[]>([]);
+	const [runViewTab, setRunViewTab] = createSignal<'logs' | 'tests' | 'coverage' | 'resources'>('logs');
 	let logContainerRef: HTMLDivElement | undefined;
 
 	// Project + pipeline names for breadcrumb
@@ -207,6 +212,34 @@ const RunDetailPage: Component = () => {
 	const stages = () => run()?.stages ?? [];
 	const jobs = () => run()?.jobs ?? [];
 	const steps = () => run()?.steps ?? [];
+
+	// Fetch test results, coverage, and resource metrics lazily when tabs are activated
+	const [testResultXml, setTestResultXml] = createSignal<string | undefined>(undefined);
+	const [coverageData, setCoverageData] = createSignal<any>(undefined);
+	const [resourceData, setResourceData] = createSignal<{ points: any[]; steps: any[] }>({ points: [], steps: [] });
+	const [tabDataLoading, setTabDataLoading] = createSignal(false);
+
+	const loadTabData = async (tab: 'tests' | 'coverage' | 'resources') => {
+		setTabDataLoading(true);
+		try {
+			if (tab === 'tests' && testResultXml() === undefined) {
+				const result = await api.runMetrics.testResults(params.id, params.pid, params.rid).catch(() => ({ xml: '' }));
+				setTestResultXml(result.xml || '');
+			} else if (tab === 'coverage' && coverageData() === undefined) {
+				const result = await api.runMetrics.coverage(params.id, params.pid, params.rid).catch(() => null);
+				setCoverageData(result);
+			} else if (tab === 'resources' && resourceData().points.length === 0 && resourceData().steps.length === 0) {
+				const result = await api.runMetrics.resources(params.id, params.pid, params.rid).catch(() => ({ points: [], steps: [] }));
+				setResourceData(result);
+			}
+		} catch { /* handled by .catch above */ }
+		finally { setTabDataLoading(false); }
+	};
+
+	const handleRunViewTab = (tab: 'logs' | 'tests' | 'coverage' | 'resources') => {
+		setRunViewTab(tab);
+		if (tab !== 'logs') loadTabData(tab);
+	};
 
 	// Fetch sibling runs for prev/next navigation
 	const [siblingRuns] = createResource(
@@ -591,6 +624,32 @@ const RunDetailPage: Component = () => {
 				</div>
 			</Show>
 
+			{/* Run view tabs */}
+			<div class="flex items-center gap-1 mb-3 bg-[var(--color-bg-tertiary)] p-1 rounded-lg w-fit">
+				<For each={[
+					{ id: 'logs' as const, label: 'Logs', icon: 'M4.5 2A1.5 1.5 0 003 3.5v13A1.5 1.5 0 004.5 18h11a1.5 1.5 0 001.5-1.5V7.621a1.5 1.5 0 00-.44-1.06l-4.12-4.122A1.5 1.5 0 0011.378 2H4.5z' },
+					{ id: 'tests' as const, label: 'Tests', icon: 'M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z' },
+					{ id: 'coverage' as const, label: 'Coverage', icon: 'M10 1a6 6 0 00-3.815 10.631C7.237 12.5 8 13.443 8 14.5v.5h4v-.5c0-1.057.763-2 1.815-2.869A6 6 0 0010 1zM8 17.5a.75.75 0 01.75-.75h2.5a.75.75 0 010 1.5h-2.5a.75.75 0 01-.75-.75z' },
+					{ id: 'resources' as const, label: 'Resources', icon: 'M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H4.233a.75.75 0 00-.75.75v4a.75.75 0 001.5 0v-2.146a7 7 0 0011.712-3.138.75.75 0 00-1.383-.575zm-9.624-3.848a5.5 5.5 0 019.201-2.466l.312.31h-2.433a.75.75 0 000 1.5H16.767a.75.75 0 00.75-.75v-4a.75.75 0 00-1.5 0v2.146A7 7 0 004.305 7.454a.75.75 0 001.383.575z' },
+				]}>
+					{(tab) => (
+						<button
+							class={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+								runViewTab() === tab.id
+									? 'bg-[var(--color-bg-secondary)] text-[var(--color-text-primary)] shadow-sm'
+									: 'text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]'
+							}`}
+							onClick={() => handleRunViewTab(tab.id)}
+						>
+							<svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
+								<path fill-rule="evenodd" d={tab.icon} clip-rule="evenodd" />
+							</svg>
+							{tab.label}
+						</button>
+					)}
+				</For>
+			</div>
+
 			<Show when={!data.loading} fallback={
 				<div class="flex gap-4">
 					<div class="w-72 space-y-2">
@@ -599,8 +658,9 @@ const RunDetailPage: Component = () => {
 					<div class="flex-1 h-[500px] bg-[var(--color-bg-secondary)] rounded-lg animate-pulse" />
 				</div>
 			}>
-				{/* Main content: stage tree + log viewer */}
-				<div class="flex gap-4 h-[calc(100vh-200px)] min-h-[500px]">
+				{/* Logs tab: stage tree + log viewer */}
+				<Show when={runViewTab() === 'logs'}>
+				<div class="flex gap-4 h-[calc(100vh-240px)] min-h-[500px]">
 					{/* Stage/Job/Step tree sidebar */}
 					<div class="w-72 flex-shrink-0 overflow-y-auto bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border-primary)]">
 						<div class="p-2">
@@ -800,6 +860,94 @@ const RunDetailPage: Component = () => {
 						</div>
 					</div>
 				</div>
+				</Show>
+
+				{/* Tests tab */}
+				<Show when={runViewTab() === 'tests'}>
+					<div class="bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border-primary)] p-4">
+						<Show when={!tabDataLoading()} fallback={
+							<div class="flex items-center justify-center py-16 text-[var(--color-text-tertiary)]">
+								<div class="flex items-center gap-2">
+									<svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+										<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+										<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+									</svg>
+									<span class="text-sm">Loading test results...</span>
+								</div>
+							</div>
+						}>
+							<Suspense fallback={<div class="text-center py-8 text-sm text-[var(--color-text-tertiary)]">Loading component...</div>}>
+								<Show when={testResultXml() && testResultXml()!.length > 0} fallback={
+									<div class="flex flex-col items-center justify-center py-16 text-[var(--color-text-tertiary)]">
+										<svg class="w-10 h-10 mb-3 opacity-40" viewBox="0 0 20 20" fill="currentColor">
+											<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd" />
+										</svg>
+										<p class="text-sm">No test results available for this run.</p>
+										<p class="text-xs mt-1 text-[var(--color-text-tertiary)]">Test results are generated from JUnit XML reports.</p>
+									</div>
+								}>
+									<TestResults xmlContent={testResultXml()} />
+								</Show>
+							</Suspense>
+						</Show>
+					</div>
+				</Show>
+
+				{/* Coverage tab */}
+				<Show when={runViewTab() === 'coverage'}>
+					<div class="bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border-primary)] p-4">
+						<Show when={!tabDataLoading()} fallback={
+							<div class="flex items-center justify-center py-16 text-[var(--color-text-tertiary)]">
+								<div class="flex items-center gap-2">
+									<svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+										<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+										<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+									</svg>
+									<span class="text-sm">Loading coverage data...</span>
+								</div>
+							</div>
+						}>
+							<Suspense fallback={<div class="text-center py-8 text-sm text-[var(--color-text-tertiary)]">Loading component...</div>}>
+								<Show when={coverageData()} fallback={
+									<div class="flex flex-col items-center justify-center py-16 text-[var(--color-text-tertiary)]">
+										<svg class="w-10 h-10 mb-3 opacity-40" viewBox="0 0 20 20" fill="currentColor">
+											<path d="M10 1a6 6 0 00-3.815 10.631C7.237 12.5 8 13.443 8 14.5v.5h4v-.5c0-1.057.763-2 1.815-2.869A6 6 0 0010 1zM8 17.5a.75.75 0 01.75-.75h2.5a.75.75 0 010 1.5h-2.5a.75.75 0 01-.75-.75z" />
+										</svg>
+										<p class="text-sm">No coverage data available for this run.</p>
+										<p class="text-xs mt-1 text-[var(--color-text-tertiary)]">Coverage data is generated from test coverage reports.</p>
+									</div>
+								}>
+									<CoverageReport data={coverageData()} />
+								</Show>
+							</Suspense>
+						</Show>
+					</div>
+				</Show>
+
+				{/* Resources tab */}
+				<Show when={runViewTab() === 'resources'}>
+					<div class="bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border-primary)] p-4">
+						<Show when={!tabDataLoading()} fallback={
+							<div class="flex items-center justify-center py-16 text-[var(--color-text-tertiary)]">
+								<div class="flex items-center gap-2">
+									<svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+										<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+										<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+									</svg>
+									<span class="text-sm">Loading resource data...</span>
+								</div>
+							</div>
+						}>
+							<Suspense fallback={<div class="text-center py-8 text-sm text-[var(--color-text-tertiary)]">Loading component...</div>}>
+								<ResourceGraph
+									data={resourceData().points}
+									steps={resourceData().steps}
+									totalDurationMs={run()?.duration_ms}
+								/>
+							</Suspense>
+						</Show>
+					</div>
+				</Show>
 			</Show>
 		</div>
 	);

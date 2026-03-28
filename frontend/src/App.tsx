@@ -23,6 +23,7 @@ import RunDetailPage from './pages/runs/RunDetailPage';
 import RunsPage from './pages/runs/RunsPage';
 import AgentsPage from './pages/agents/AgentsPage';
 import ApprovalsPage from './pages/approvals/ApprovalsPage';
+import TemplatesPage from './pages/pipelines/TemplatesPage';
 import SettingsPage from './pages/settings/SettingsPage';
 import AdminPage from './pages/admin/AdminPage';
 
@@ -108,6 +109,7 @@ const App: Component = () => {
 						<Route path="/projects/:id/pipelines/:pid/runs/:rid" component={RunDetailPage} />
 						<Route path="/runs" component={RunsPage} />
 						<Route path="/agents" component={AgentsPage} />
+						<Route path="/templates" component={TemplatesPage} />
 						<Route path="/approvals" component={ApprovalsPage} />
 						<Route path="/settings/*rest" component={SettingsPage} />
 						<Route path="/admin/*rest" component={AdminPage} />

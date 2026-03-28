@@ -53,7 +53,7 @@ func rootCmd() error {
 		return loginCmd(subArgs)
 	case "pipelines":
 		return pipelinesCmd(subArgs)
-	case "runs":
+	case "runs", "run":
 		return runsCmd(subArgs)
 	case "agents":
 		return agentsCmd(subArgs)
@@ -61,6 +61,12 @@ func rootCmd() error {
 		return secretsCmd(subArgs)
 	case "artifacts":
 		return artifactsCmd(subArgs)
+	case "projects":
+		return projectsCmd(subArgs)
+	case "templates":
+		return templatesCmd(subArgs)
+	case "backup":
+		return backupCmd(subArgs)
 	case "config":
 		return configCmd(subArgs)
 	case "version":
@@ -84,9 +90,12 @@ Commands:
   login       Authenticate with FlowForge server
   pipelines   Manage pipelines (list, get, create, update, delete, trigger)
   runs        Manage pipeline runs (list, get, logs, cancel, rerun)
+  projects    Manage projects (list, get, create)
   agents      Manage build agents (list, get, drain)
   secrets     Manage secrets (list, set, delete)
   artifacts   Manage build artifacts (list, download)
+  templates   Browse pipeline templates (list, get)
+  backup      Database backup/restore (create, list, restore)
   config      View/set CLI configuration
   version     Print version information
 
@@ -646,6 +655,234 @@ func configCmd(args []string) error {
 
 	default:
 		return fmt.Errorf("unknown config subcommand: %s", args[0])
+	}
+}
+
+// projectsCmd handles the "projects" subcommand.
+func projectsCmd(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("Usage: flowforge projects <list|get|create> [flags]")
+		return nil
+	}
+
+	client := newClient()
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "list":
+		data, err := client.get("/api/v1/projects")
+		if err != nil {
+			return err
+		}
+
+		if output == "json" {
+			printJSON(data)
+			return nil
+		}
+
+		var result struct {
+			Projects []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+				Slug string `json:"slug"`
+			} `json:"projects"`
+		}
+		json.Unmarshal(data, &result)
+
+		headers := []string{"ID", "NAME", "SLUG"}
+		var rows [][]string
+		for _, p := range result.Projects {
+			rows = append(rows, []string{p.ID, p.Name, p.Slug})
+		}
+		printTable(headers, rows)
+		return nil
+
+	case "get":
+		if len(subArgs) == 0 {
+			return fmt.Errorf("usage: flowforge projects get <project-id>")
+		}
+		data, err := client.get(fmt.Sprintf("/api/v1/projects/%s", subArgs[0]))
+		if err != nil {
+			return err
+		}
+		printJSON(data)
+		return nil
+
+	case "create":
+		fs := flag.NewFlagSet("projects create", flag.ContinueOnError)
+		name := fs.String("name", "", "Project name")
+		desc := fs.String("description", "", "Project description")
+		fs.Parse(subArgs)
+
+		if *name == "" {
+			return fmt.Errorf("--name is required")
+		}
+
+		body := map[string]string{"name": *name, "description": *desc}
+		data, err := client.post("/api/v1/projects", body)
+		if err != nil {
+			return err
+		}
+
+		var result struct {
+			ID string `json:"id"`
+		}
+		json.Unmarshal(data, &result)
+		fmt.Printf("Project created. ID: %s\n", result.ID)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown projects subcommand: %s", sub)
+	}
+}
+
+// templatesCmd handles the "templates" subcommand.
+func templatesCmd(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("Usage: flowforge templates <list|get> [flags]")
+		return nil
+	}
+
+	client := newClient()
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "list":
+		fs := flag.NewFlagSet("templates list", flag.ContinueOnError)
+		category := fs.String("category", "", "Filter by category")
+		fs.Parse(subArgs)
+
+		url := "/api/v1/templates"
+		if *category != "" {
+			url += "?category=" + *category
+		}
+
+		data, err := client.get(url)
+		if err != nil {
+			return err
+		}
+
+		if output == "json" {
+			printJSON(data)
+			return nil
+		}
+
+		var result struct {
+			Templates []struct {
+				ID       string `json:"id"`
+				Name     string `json:"name"`
+				Category string `json:"category"`
+				Builtin  int    `json:"is_builtin"`
+			} `json:"templates"`
+		}
+		json.Unmarshal(data, &result)
+
+		headers := []string{"ID", "NAME", "CATEGORY", "BUILTIN"}
+		var rows [][]string
+		for _, t := range result.Templates {
+			builtin := "no"
+			if t.Builtin == 1 {
+				builtin = "yes"
+			}
+			rows = append(rows, []string{t.ID, t.Name, t.Category, builtin})
+		}
+		printTable(headers, rows)
+		return nil
+
+	case "get":
+		if len(subArgs) == 0 {
+			return fmt.Errorf("usage: flowforge templates get <template-id>")
+		}
+		data, err := client.get(fmt.Sprintf("/api/v1/templates/%s", subArgs[0]))
+		if err != nil {
+			return err
+		}
+		printJSON(data)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown templates subcommand: %s", sub)
+	}
+}
+
+// backupCmd handles the "backup" subcommand.
+func backupCmd(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("Usage: flowforge backup <create|list|restore> [flags]")
+		return nil
+	}
+
+	client := newClient()
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "create":
+		data, err := client.post("/api/v1/admin/backup", nil)
+		if err != nil {
+			return err
+		}
+		var result struct {
+			Filename string `json:"filename"`
+			Size     int64  `json:"size_bytes"`
+		}
+		json.Unmarshal(data, &result)
+		fmt.Printf("Backup created: %s (%s)\n", result.Filename, formatBytes(result.Size))
+		return nil
+
+	case "list":
+		data, err := client.get("/api/v1/admin/backups")
+		if err != nil {
+			return err
+		}
+
+		if output == "json" {
+			printJSON(data)
+			return nil
+		}
+
+		var result struct {
+			Backups []struct {
+				ID       string `json:"id"`
+				Filename string `json:"filename"`
+				Size     int64  `json:"size_bytes"`
+			} `json:"backups"`
+		}
+		json.Unmarshal(data, &result)
+
+		headers := []string{"ID", "FILENAME", "SIZE"}
+		var rows [][]string
+		for _, b := range result.Backups {
+			rows = append(rows, []string{b.ID, b.Filename, formatBytes(b.Size)})
+		}
+		printTable(headers, rows)
+		return nil
+
+	case "restore":
+		fs := flag.NewFlagSet("backup restore", flag.ContinueOnError)
+		backupID := fs.String("id", "", "Backup ID or filename")
+		fs.Parse(subArgs)
+
+		if *backupID == "" {
+			if fs.Arg(0) != "" {
+				*backupID = fs.Arg(0)
+			} else {
+				return fmt.Errorf("--id or backup ID argument is required")
+			}
+		}
+
+		body := map[string]string{"backup_id": *backupID}
+		_, err := client.post("/api/v1/admin/restore", body)
+		if err != nil {
+			return err
+		}
+		fmt.Println("Database restored. Server restart required.")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown backup subcommand: %s", sub)
 	}
 }
 

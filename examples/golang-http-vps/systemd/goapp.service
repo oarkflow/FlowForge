@@ -1,0 +1,50 @@
+[Unit]
+Description=Go HTTP Server Application
+Documentation=https://github.com/your-org/goapp
+After=network.target postgresql.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=goapp
+Group=goapp
+
+# Working directory is the current release
+WorkingDirectory=/opt/goapp/current
+
+# Environment file
+EnvironmentFile=/opt/goapp/shared/.env
+
+# Run the Go binary
+ExecStart=/opt/goapp/current/server
+
+# Graceful shutdown (SIGTERM)
+ExecStop=/bin/kill -SIGTERM $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/goapp /var/log/goapp /tmp
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=goapp
+
+[Install]
+WantedBy=multi-user.target

@@ -11,6 +11,7 @@ import (
 	"github.com/oarkflow/deploy/backend/internal/integrations/bitbucket"
 	"github.com/oarkflow/deploy/backend/internal/integrations/github"
 	"github.com/oarkflow/deploy/backend/internal/integrations/gitlab"
+	"github.com/oarkflow/deploy/backend/internal/secrets"
 )
 
 // ImportRequest describes what to import and how.
@@ -29,11 +30,12 @@ type ImportRequest struct {
 
 // ImportResult holds the outcome of an import detection.
 type ImportResult struct {
-	WorkDir       string                    `json:"work_dir"`
-	Detections    []detector.DetectionResult `json:"detections"`
-	GeneratedYAML string                    `json:"generated_pipeline"`
-	DefaultBranch string                    `json:"default_branch"`
-	CloneURL      string                    `json:"clone_url"`
+	WorkDir        string                    `json:"work_dir"`
+	Detections     []detector.DetectionResult `json:"detections"`
+	GeneratedYAML  string                    `json:"generated_pipeline"`
+	DefaultBranch  string                    `json:"default_branch"`
+	CloneURL       string                    `json:"clone_url"`
+	SecretFindings []secrets.ScanFinding     `json:"secret_findings,omitempty"`
 }
 
 // Service orchestrates project import: resolve source -> detect -> generate pipeline.
@@ -138,12 +140,17 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 	// Generate starter pipeline.
 	generatedYAML := detector.GenerateStarterPipeline(detections)
 
+	// Run secret scanning on the imported repo.
+	scanner := secrets.NewScanner()
+	findings, _ := scanner.ScanDirectory(workDir)
+
 	return &ImportResult{
-		WorkDir:       workDir,
-		Detections:    detections,
-		GeneratedYAML: generatedYAML,
-		DefaultBranch: defaultBranch,
-		CloneURL:      cloneURL,
+		WorkDir:        workDir,
+		Detections:     detections,
+		GeneratedYAML:  generatedYAML,
+		DefaultBranch:  defaultBranch,
+		CloneURL:       cloneURL,
+		SecretFindings: findings,
 	}, nil
 }
 

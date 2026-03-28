@@ -17,16 +17,23 @@ import (
 	"github.com/gofiber/fiber/v3/middleware/recover"
 
 	agentpkg "github.com/oarkflow/deploy/backend/internal/agent"
+	"github.com/oarkflow/deploy/backend/internal/admin"
 	"github.com/oarkflow/deploy/backend/internal/api"
+	"github.com/oarkflow/deploy/backend/internal/api/handlers"
 	"github.com/oarkflow/deploy/backend/internal/api/middleware"
 	"github.com/oarkflow/deploy/backend/internal/config"
 	"github.com/oarkflow/deploy/backend/internal/db"
 	"github.com/oarkflow/deploy/backend/internal/db/queries"
 	"github.com/oarkflow/deploy/backend/internal/engine"
+	"github.com/oarkflow/deploy/backend/internal/engine/queue"
+	"github.com/oarkflow/deploy/backend/internal/features"
 	"github.com/oarkflow/deploy/backend/internal/importer"
+	"github.com/oarkflow/deploy/backend/internal/logging"
 	"github.com/oarkflow/deploy/backend/internal/notifications"
 	"github.com/oarkflow/deploy/backend/internal/scheduler"
+	securitypkg "github.com/oarkflow/deploy/backend/internal/security"
 	"github.com/oarkflow/deploy/backend/internal/storage"
+	"github.com/oarkflow/deploy/backend/internal/templates"
 	ws "github.com/oarkflow/deploy/backend/internal/websocket"
 	"github.com/oarkflow/deploy/backend/internal/worker"
 	pkglogger "github.com/oarkflow/deploy/backend/pkg/logger"
@@ -90,10 +97,23 @@ func main() {
 	// Import Service
 	importSvc := importer.New(encKey)
 
-	// Agent System (pool, dispatcher, heartbeat monitor, server)
+	// Agent System (pool, dispatcher, heartbeat monitor, HTTP server, gRPC server)
 	agentPool := agentpkg.NewPool()
 	agentDispatcher := agentpkg.NewDispatcher(agentPool, 256)
 	agentServer := agentpkg.NewServer(agentPool, agentDispatcher, database)
+
+	// gRPC agent server — runs alongside HTTP for agents that prefer gRPC transport
+	grpcAgentServer := agentpkg.NewGRPCAgentServer(agentPool, agentDispatcher, database, hub)
+	var grpcSrv interface{ Stop() }
+	if cfg.GRPCPort != "" {
+		srv, lis, err := grpcAgentServer.StartServer(":" + cfg.GRPCPort)
+		if err != nil {
+			appLog.Error().Err(err).Msg("failed to start gRPC agent server")
+		} else {
+			grpcSrv = srv
+			appLog.Info().Str("grpc_port", cfg.GRPCPort).Str("addr", lis.Addr().String()).Msg("gRPC agent server started")
+		}
+	}
 
 	heartbeatMonitor := agentpkg.NewHeartbeatMonitor(agentPool, 60*time.Second, 10*time.Second)
 	heartbeatMonitor.OnEvict(func(agentID string) {
@@ -122,6 +142,63 @@ func main() {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	go workerPool.Start(workerCtx)
 
+	// ---- New Services ----
+
+	// Pipeline Template Store
+	tmplStore := templates.NewStore(repos.Templates)
+	tmplCtx := context.Background()
+	if err := tmplStore.SeedBuiltins(tmplCtx); err != nil {
+		appLog.Warn().Err(err).Msg("failed to seed builtin templates")
+	}
+	handlers.SetTemplateStore(tmplStore)
+
+	// Feature Flags
+	flagSvc := features.NewFlagService(repos.FeatureFlags)
+	handlers.SetFlagService(flagSvc)
+
+	// Dead-Letter Queue
+	dlq := queue.NewDeadLetterQueue(repos.DeadLetters)
+	handlers.SetDeadLetterQueue(dlq)
+
+	// Backup Service
+	backupSvc := admin.NewBackupService(database, cfg.BackupDir)
+	handlers.SetBackupService(backupSvc)
+
+	// Security Scan Service
+	scanSvc := securitypkg.NewScanService(repos.ScanResults)
+	handlers.SetScanService(scanSvc)
+
+	// Log Retention Worker
+	retentionCtx, retentionCancel := context.WithCancel(context.Background())
+	retentionWorker := logging.NewRetentionWorker(repos, cfg.GlobalLogRetentionDays)
+	go retentionWorker.Start(retentionCtx)
+
+	// Log Forwarding Manager
+	var logFwdManager *logging.ForwarderManager
+	if cfg.LogForwardingEnabled && cfg.LogForwardingType != "" {
+		fwdCfg := logging.ForwarderConfig{
+			Type:      cfg.LogForwardingType,
+			Endpoint:  cfg.LogForwardingURL,
+			AuthToken: cfg.LogForwardingToken,
+			Index:     cfg.LogForwardingIndex,
+		}
+		logFwdManager = logging.NewForwarderManager([]logging.ForwarderConfig{fwdCfg})
+		fwdCtx, _ := context.WithCancel(context.Background())
+		logFwdManager.Start(fwdCtx, 5*time.Second)
+		appLog.Info().Str("type", cfg.LogForwardingType).Msg("log forwarding enabled")
+	}
+	_ = logFwdManager // available for engine integration
+
+	// Scheduled Backup
+	if cfg.BackupInterval != "" {
+		interval, err := time.ParseDuration(cfg.BackupInterval)
+		if err == nil && interval > 0 {
+			backupCtx, _ := context.WithCancel(context.Background())
+			go backupSvc.ScheduledBackup(backupCtx, interval)
+			appLog.Info().Str("interval", cfg.BackupInterval).Msg("scheduled backups enabled")
+		}
+	}
+
 	// Fiber app
 	app := fiber.New(fiber.Config{
 		AppName:      "FlowForge v1.0",
@@ -146,6 +223,15 @@ func main() {
 	// Rate limiter applies only to REST API routes (registered after this point)
 	app.Use(middleware.RateLimiter(100, time.Minute))
 
+	// Per-user rate limiter (applied after auth extracts user info)
+	userLimiter := middleware.NewUserRateLimiter(middleware.RoleLimits{
+		Owner:     2000,
+		Admin:     cfg.RateLimitAdmin,
+		Developer: cfg.RateLimitDeveloper,
+		Viewer:    cfg.RateLimitViewer,
+	}, time.Minute)
+	app.Use(userLimiter.Handler())
+
 	// Register REST API routes
 	api.RegisterRoutes(app, database, cfg, importSvc, agentServer, eng)
 
@@ -161,6 +247,7 @@ func main() {
 
 	appLog.Info().
 		Str("port", cfg.Port).
+		Str("grpc_port", cfg.GRPCPort).
 		Str("database", cfg.DatabasePath).
 		Bool("embedded_worker", cfg.EmbeddedWorker).
 		Msg("FlowForge server is running")
@@ -179,6 +266,14 @@ func main() {
 	heartbeatCancel()
 	dispatchCancel()
 	workerCancel()
+	retentionCancel()
+	if grpcSrv != nil {
+		grpcSrv.Stop()
+		appLog.Info().Msg("gRPC agent server stopped")
+	}
+	if logFwdManager != nil {
+		logFwdManager.Close()
+	}
 
 	if err := app.Shutdown(); err != nil {
 		appLog.Error().Err(err).Msg("shutdown error")

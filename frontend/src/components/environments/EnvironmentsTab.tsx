@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { createSignal, createResource, For, Show, createMemo } from 'solid-js';
+import { createSignal, createResource, For, Show, createMemo, onMount } from 'solid-js';
 import Card from '../ui/Card';
 import Badge from '../ui/Badge';
 import type { BadgeVariant } from '../ui/Badge';
@@ -9,7 +9,7 @@ import Modal from '../ui/Modal';
 import KeyValueEditor, { type KeyValuePair } from '../ui/KeyValueEditor';
 import { toast } from '../ui/Toast';
 import { api, ApiRequestError } from '../../api/client';
-import type { Environment, Deployment, EnvOverride, DeployStrategy, RollingConfig, BlueGreenConfig, CanaryConfig, CanaryStep, HealthResult, Approval } from '../../types';
+import type { Environment, Deployment, EnvOverride, DeployStrategy, RollingConfig, BlueGreenConfig, CanaryConfig, CanaryStep, HealthResult, Approval, ProjectEnvironmentChainEdge } from '../../types';
 import { formatRelativeTime } from '../../utils/helpers';
 
 // ---------------------------------------------------------------------------
@@ -198,6 +198,14 @@ const EnvironmentsTab: Component<EnvironmentsTabProps> = (props) => {
 	const [protMinApprovals, setProtMinApprovals] = createSignal(1);
 	const [protApprovers, setProtApprovers] = createSignal('');
 	const [savingProtection, setSavingProtection] = createSignal(false);
+
+	// Promotion chain state
+	const [chainEdges, setChainEdges] = createSignal<ProjectEnvironmentChainEdge[]>([]);
+	const [chainDraft, setChainDraft] = createSignal<{ source_environment_id: string; target_environment_id: string }[]>([]);
+	const [chainDirty, setChainDirty] = createSignal(false);
+	const [savingChain, setSavingChain] = createSignal(false);
+	const [loadingChain, setLoadingChain] = createSignal(false);
+	const [showChainEditor, setShowChainEditor] = createSignal(false);
 
 	// Successful (live or rolled_back) deployments for rollback
 	const rollbackCandidates = createMemo(() =>
@@ -626,6 +634,79 @@ const EnvironmentsTab: Component<EnvironmentsTabProps> = (props) => {
 		setCanaryConfig({ ...cfg, steps });
 	};
 
+	// Promotion chain handlers
+	const loadChain = async () => {
+		setLoadingChain(true);
+		try {
+			const edges = await api.environmentChain.get(props.projectId);
+			setChainEdges(edges);
+			setChainDraft(edges.map(e => ({ source_environment_id: e.source_environment_id, target_environment_id: e.target_environment_id })));
+			setChainDirty(false);
+		} catch {
+			// Chain may not exist yet, that's fine
+			setChainEdges([]);
+			setChainDraft([]);
+		} finally {
+			setLoadingChain(false);
+		}
+	};
+
+	const handleSaveChain = async () => {
+		setSavingChain(true);
+		try {
+			const edges = chainDraft().filter(e => e.source_environment_id && e.target_environment_id).map((e, i) => ({
+				source_environment_id: e.source_environment_id,
+				target_environment_id: e.target_environment_id,
+				position: i,
+			}));
+			await api.environmentChain.update(props.projectId, edges);
+			toast.success('Promotion chain saved');
+			setChainDirty(false);
+			await loadChain();
+		} catch (err) {
+			toast.error(err instanceof ApiRequestError ? err.message : 'Failed to save promotion chain');
+		} finally {
+			setSavingChain(false);
+		}
+	};
+
+	const addChainLink = () => {
+		setChainDraft([...chainDraft(), { source_environment_id: '', target_environment_id: '' }]);
+		setChainDirty(true);
+	};
+
+	const removeChainLink = (index: number) => {
+		setChainDraft(chainDraft().filter((_, i) => i !== index));
+		setChainDirty(true);
+	};
+
+	const updateChainLink = (index: number, field: 'source_environment_id' | 'target_environment_id', value: string) => {
+		const draft = [...chainDraft()];
+		draft[index] = { ...draft[index], [field]: value };
+		setChainDraft(draft);
+		setChainDirty(true);
+	};
+
+	const moveChainLink = (index: number, direction: 'up' | 'down') => {
+		const draft = [...chainDraft()];
+		const newIndex = direction === 'up' ? index - 1 : index + 1;
+		if (newIndex < 0 || newIndex >= draft.length) return;
+		[draft[index], draft[newIndex]] = [draft[newIndex], draft[index]];
+		setChainDraft(draft);
+		setChainDirty(true);
+	};
+
+	// Helper: get environment name by id
+	const envNameById = (id: string): string => {
+		const found = (environments() ?? []).find(e => e.env.id === id);
+		return found ? found.env.name : id.substring(0, 8);
+	};
+
+	// Load chain on mount
+	onMount(() => {
+		loadChain();
+	});
+
 	// ---------------------------------------------------------------------------
 	// Render
 	// ---------------------------------------------------------------------------
@@ -659,6 +740,64 @@ const EnvironmentsTab: Component<EnvironmentsTabProps> = (props) => {
 						<Button onClick={() => setShowCreate(true)}>Create Environment</Button>
 					</div>
 				}>
+					{/* Promotion Flow Visualization */}
+					<Show when={(environments() ?? []).length >= 2}>
+						<div class="mb-6 p-4 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border-primary)]">
+							<div class="flex items-center gap-2 mb-3">
+								<svg class="w-4 h-4 text-[var(--color-text-tertiary)]" viewBox="0 0 20 20" fill="currentColor">
+									<path fill-rule="evenodd" d="M3 10a.75.75 0 01.75-.75h10.638L10.23 5.29a.75.75 0 111.04-1.08l5.5 5.25a.75.75 0 010 1.08l-5.5 5.25a.75.75 0 11-1.04-1.08l4.158-3.96H3.75A.75.75 0 013 10z" clip-rule="evenodd" />
+								</svg>
+								<span class="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">Promotion Flow</span>
+							</div>
+							<div class="flex items-center gap-2 overflow-x-auto pb-1">
+								<For each={(environments() ?? []).sort((a, b) => {
+									// Sort: non-production first, production last
+									if (a.env.is_production !== b.env.is_production) return a.env.is_production ? 1 : -1;
+									return a.env.name.localeCompare(b.env.name);
+								})}>
+									{({ env, latestDeployment }, i) => (
+										<>
+											<Show when={i() > 0}>
+												<div class="flex flex-col items-center gap-0.5 flex-shrink-0">
+													<svg class="w-5 h-5 text-[var(--color-text-tertiary)]" viewBox="0 0 20 20" fill="currentColor">
+														<path fill-rule="evenodd" d="M3 10a.75.75 0 01.75-.75h10.638L10.23 5.29a.75.75 0 111.04-1.08l5.5 5.25a.75.75 0 010 1.08l-5.5 5.25a.75.75 0 11-1.04-1.08l4.158-3.96H3.75A.75.75 0 013 10z" clip-rule="evenodd" />
+													</svg>
+													<span class="text-[9px] text-[var(--color-text-tertiary)]">promote</span>
+												</div>
+											</Show>
+											<div
+												class={`flex-shrink-0 px-4 py-2.5 rounded-lg border-2 cursor-pointer transition-all min-w-[140px] text-center ${env.is_production
+													? 'border-amber-500/40 bg-amber-500/5 hover:border-amber-500/60'
+													: latestDeployment?.status === 'live'
+														? 'border-emerald-500/40 bg-emerald-500/5 hover:border-emerald-500/60'
+														: 'border-[var(--color-border-primary)] bg-[var(--color-bg-tertiary)] hover:border-indigo-500/30'
+													}`}
+												onClick={() => openDetail(env)}
+											>
+												<div class="text-xs font-semibold text-[var(--color-text-primary)] truncate">{env.name}</div>
+												<div class="flex items-center justify-center gap-1.5 mt-1">
+													<div class={`w-1.5 h-1.5 rounded-full ${latestDeployment?.status === 'live' ? 'bg-emerald-400' :
+														latestDeployment?.status === 'deploying' ? 'bg-violet-400 animate-pulse' :
+															latestDeployment?.status === 'failed' ? 'bg-red-400' :
+																'bg-gray-500'
+														}`} />
+													<span class="text-[10px] text-[var(--color-text-tertiary)]">
+														{latestDeployment?.version ? `v${latestDeployment.version}` : 'No deploy'}
+													</span>
+												</div>
+												<Show when={env.lock_owner_id}>
+													<div class="mt-1">
+														<span class="text-[9px] text-red-400 font-medium">LOCKED</span>
+													</div>
+												</Show>
+											</div>
+										</>
+									)}
+								</For>
+							</div>
+						</div>
+					</Show>
+
 					<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 						<For each={environments() ?? []}>
 							{({ env, latestDeployment }) => (
@@ -759,6 +898,203 @@ const EnvironmentsTab: Component<EnvironmentsTabProps> = (props) => {
 						</For>
 					</div>
 				</Show>
+			</Show>
+
+			{/* ===== Promotion Chain Section ===== */}
+			<Show when={(environments() ?? []).length >= 2}>
+				<div class="mt-6 p-4 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border-primary)]">
+					<div class="flex items-center justify-between mb-3">
+						<div class="flex items-center gap-2">
+							<svg class="w-4 h-4 text-[var(--color-text-tertiary)]" viewBox="0 0 20 20" fill="currentColor">
+								<path fill-rule="evenodd" d="M3 10a.75.75 0 01.75-.75h10.638L10.23 5.29a.75.75 0 111.04-1.08l5.5 5.25a.75.75 0 010 1.08l-5.5 5.25a.75.75 0 11-1.04-1.08l4.158-3.96H3.75A.75.75 0 013 10z" clip-rule="evenodd" />
+							</svg>
+							<span class="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">Promotion Chain</span>
+						</div>
+						<Button size="sm" variant="ghost" onClick={() => { setShowChainEditor(!showChainEditor()); if (!showChainEditor()) loadChain(); }}>
+							{showChainEditor() ? 'Close Editor' : 'Configure'}
+						</Button>
+					</div>
+
+					{/* Chain visualization */}
+					<Show when={!loadingChain()} fallback={
+						<div class="h-12 bg-[var(--color-bg-tertiary)] rounded-lg animate-pulse" />
+					}>
+						<Show when={chainEdges().length > 0} fallback={
+							<Show when={!showChainEditor()}>
+								<div class="text-center py-4">
+									<p class="text-sm text-[var(--color-text-tertiary)] mb-2">No promotion chain configured</p>
+									<p class="text-xs text-[var(--color-text-tertiary)] mb-3">Define the order deployments promote through environments (e.g., Beta → Stage → Prod)</p>
+									<Button size="sm" variant="outline" onClick={() => setShowChainEditor(true)}>
+										Configure Promotion Chain
+									</Button>
+								</div>
+							</Show>
+						}>
+							<div class="flex items-center gap-2 overflow-x-auto pb-1">
+								{(() => {
+									// Build ordered chain from edges
+									const edges = chainEdges();
+									const envList = (environments() ?? []);
+									// Find starting environments (sources that aren't targets)
+									const targetIds = new Set(edges.map(e => e.target_environment_id));
+									const startEdges = edges.filter(e => !targetIds.has(e.source_environment_id));
+									const orderedIds: string[] = [];
+									// Walk the chain
+									const walk = (id: string) => {
+										if (orderedIds.includes(id)) return;
+										orderedIds.push(id);
+										const next = edges.find(e => e.source_environment_id === id);
+										if (next) walk(next.target_environment_id);
+									};
+									if (startEdges.length > 0) {
+										walk(startEdges[0].source_environment_id);
+									} else if (edges.length > 0) {
+										walk(edges[0].source_environment_id);
+									}
+									// Ensure we have target of last edge
+									if (edges.length > 0) {
+										const lastEdge = edges[edges.length - 1];
+										if (!orderedIds.includes(lastEdge.target_environment_id)) {
+											orderedIds.push(lastEdge.target_environment_id);
+										}
+									}
+									return (
+										<For each={orderedIds}>
+											{(envId, i) => {
+												const envData = envList.find(e => e.env.id === envId);
+												const env = envData?.env;
+												const latestDeployment = envData?.latestDeployment;
+												return (
+													<>
+														<Show when={i() > 0}>
+															<div class="flex flex-col items-center gap-0.5 flex-shrink-0">
+																<svg class="w-5 h-5 text-indigo-400" viewBox="0 0 20 20" fill="currentColor">
+																	<path fill-rule="evenodd" d="M3 10a.75.75 0 01.75-.75h10.638L10.23 5.29a.75.75 0 111.04-1.08l5.5 5.25a.75.75 0 010 1.08l-5.5 5.25a.75.75 0 11-1.04-1.08l4.158-3.96H3.75A.75.75 0 013 10z" clip-rule="evenodd" />
+																</svg>
+																<span class="text-[9px] text-indigo-400/60">promote</span>
+															</div>
+														</Show>
+														<div
+															class={`flex-shrink-0 px-4 py-2.5 rounded-lg border-2 cursor-pointer transition-all min-w-[140px] text-center ${env?.is_production
+																	? 'border-amber-500/40 bg-amber-500/5 hover:border-amber-500/60'
+																	: latestDeployment?.status === 'live'
+																		? 'border-emerald-500/40 bg-emerald-500/5 hover:border-emerald-500/60'
+																		: 'border-[var(--color-border-primary)] bg-[var(--color-bg-tertiary)] hover:border-indigo-500/30'
+																}`}
+															onClick={() => env && openDetail(env)}
+														>
+															<div class="text-xs font-semibold text-[var(--color-text-primary)] truncate">{env?.name ?? envId.substring(0, 8)}</div>
+															<div class="flex items-center justify-center gap-1.5 mt-1">
+																<div class={`w-1.5 h-1.5 rounded-full ${latestDeployment?.status === 'live' ? 'bg-emerald-400' :
+																		latestDeployment?.status === 'deploying' ? 'bg-violet-400 animate-pulse' :
+																			latestDeployment?.status === 'failed' ? 'bg-red-400' :
+																				'bg-gray-500'
+																	}`} />
+																<span class="text-[10px] text-[var(--color-text-tertiary)]">
+																	{latestDeployment?.version ? `v${latestDeployment.version}` : 'No deploy'}
+																</span>
+															</div>
+														</div>
+													</>
+												);
+											}}
+										</For>
+									);
+								})()}
+							</div>
+						</Show>
+					</Show>
+
+					{/* Chain editor */}
+					<Show when={showChainEditor()}>
+						<div class="mt-4 pt-4 border-t border-[var(--color-border-primary)]">
+							<p class="text-xs text-[var(--color-text-tertiary)] mb-3">
+								Define source → target pairs to create the promotion chain. Each link represents an allowed promotion path.
+							</p>
+							<div class="space-y-2 mb-3">
+								<For each={chainDraft()}>
+									{(link, i) => (
+										<div class="flex items-center gap-2">
+											<span class="text-xs text-[var(--color-text-tertiary)] w-6">#{i() + 1}</span>
+											<select
+												class="flex-1 px-3 py-2 rounded-lg bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+												value={link.source_environment_id}
+												onChange={(e) => updateChainLink(i(), 'source_environment_id', e.currentTarget.value)}
+											>
+												<option value="">Select source...</option>
+												<For each={(environments() ?? []).map(e => e.env)}>
+													{(env) => <option value={env.id}>{env.name}</option>}
+												</For>
+											</select>
+											<svg class="w-5 h-5 text-[var(--color-text-tertiary)] flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+												<path fill-rule="evenodd" d="M3 10a.75.75 0 01.75-.75h10.638L10.23 5.29a.75.75 0 111.04-1.08l5.5 5.25a.75.75 0 010 1.08l-5.5 5.25a.75.75 0 11-1.04-1.08l4.158-3.96H3.75A.75.75 0 013 10z" clip-rule="evenodd" />
+											</svg>
+											<select
+												class="flex-1 px-3 py-2 rounded-lg bg-[var(--color-bg-primary)] border border-[var(--color-border-primary)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+												value={link.target_environment_id}
+												onChange={(e) => updateChainLink(i(), 'target_environment_id', e.currentTarget.value)}
+											>
+												<option value="">Select target...</option>
+												<For each={(environments() ?? []).map(e => e.env)}>
+													{(env) => <option value={env.id}>{env.name}</option>}
+												</For>
+											</select>
+											{/* Move up/down */}
+											<button
+												type="button"
+												onClick={() => moveChainLink(i(), 'up')}
+												disabled={i() === 0}
+												class="p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] disabled:opacity-30"
+												title="Move up"
+											>
+												<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01-.02 1.06z" clip-rule="evenodd" /></svg>
+											</button>
+											<button
+												type="button"
+												onClick={() => moveChainLink(i(), 'down')}
+												disabled={i() === chainDraft().length - 1}
+												class="p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] disabled:opacity-30"
+												title="Move down"
+											>
+												<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd" /></svg>
+											</button>
+											{/* Remove */}
+											<button
+												type="button"
+												onClick={() => removeChainLink(i())}
+												class="p-1 text-red-400 hover:text-red-300"
+												title="Remove link"
+											>
+												<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5z" clip-rule="evenodd" /></svg>
+											</button>
+										</div>
+									)}
+								</For>
+							</div>
+							<Show when={chainDraft().length === 0}>
+								<p class="text-sm text-[var(--color-text-tertiary)] text-center py-3">No chain links defined. Add a link to create the promotion flow.</p>
+							</Show>
+							<div class="flex items-center justify-between mt-3">
+								<button
+									type="button"
+									onClick={addChainLink}
+									class="text-sm text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
+								>
+									<svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
+									Add Link
+								</button>
+								<div class="flex items-center gap-2">
+									<Show when={chainDirty()}>
+										<span class="text-xs text-amber-400">Unsaved changes</span>
+									</Show>
+									<Button size="sm" onClick={handleSaveChain} loading={savingChain()} disabled={!chainDirty()}>
+										Save Chain
+									</Button>
+								</div>
+							</div>
+						</div>
+					</Show>
+				</div>
 			</Show>
 
 			{/* ===== Create Environment Modal ===== */}
@@ -1101,48 +1437,53 @@ const EnvironmentsTab: Component<EnvironmentsTabProps> = (props) => {
 							<Show when={deployments().length > 0} fallback={
 								<p class="text-sm text-[var(--color-text-tertiary)] py-4 text-center">No deployments yet.</p>
 							}>
-								<div class="border border-[var(--color-border-primary)] rounded-lg overflow-hidden">
-									<table class="w-full">
-										<thead>
-											<tr class="border-b border-[var(--color-border-primary)] bg-[var(--color-bg-secondary)]">
-												<th class="px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)] text-left">Status</th>
-												<th class="px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)] text-left">Version</th>
-												<th class="px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)] text-left">Strategy</th>
-												<th class="px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)] text-left">Commit</th>
-												<th class="px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)] text-left">Deployed By</th>
-												<th class="px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-tertiary)] text-right">Time</th>
-											</tr>
-										</thead>
-										<tbody>
-											<For each={deployments()}>
-												{(dep) => (
-													<tr class="border-b border-[var(--color-border-primary)] last:border-b-0 hover:bg-[var(--color-bg-hover)]">
-														<td class="px-4 py-2.5">
+								{/* Timeline view */}
+								<div class="space-y-0 relative">
+									<div class="absolute left-[15px] top-3 bottom-3 w-[2px] bg-[var(--color-border-primary)]" />
+									<For each={deployments()}>
+										{(dep, i) => (
+											<div class="relative flex items-start gap-3 pl-0">
+												{/* Timeline dot */}
+												<div class={`relative z-10 flex-shrink-0 w-[32px] flex justify-center pt-2`}>
+													<div class={`w-3 h-3 rounded-full border-2 ${dep.status === 'live' ? 'bg-emerald-400 border-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.4)]' :
+														dep.status === 'deploying' ? 'bg-violet-400 border-violet-400 animate-pulse' :
+															dep.status === 'failed' ? 'bg-red-400 border-red-400' :
+																dep.status === 'rolled_back' ? 'bg-amber-400 border-amber-400' :
+																	dep.status === 'pending' ? 'bg-gray-400 border-gray-400' :
+																		'bg-gray-500 border-gray-500'
+														}`} />
+												</div>
+												{/* Content */}
+												<div class={`flex-1 p-3 rounded-lg mb-2 border transition-colors ${i() === 0 ? 'bg-[var(--color-bg-secondary)] border-[var(--color-border-primary)]' : 'bg-transparent border-transparent hover:bg-[var(--color-bg-secondary)] hover:border-[var(--color-border-primary)]'
+													}`}>
+													<div class="flex items-center justify-between gap-2">
+														<div class="flex items-center gap-2 min-w-0">
 															<Badge variant={deploymentStatusVariant(dep.status)} dot size="sm">{deploymentStatusLabel(dep.status)}</Badge>
-														</td>
-														<td class="px-4 py-2.5">
-															<span class="text-sm font-mono text-[var(--color-text-primary)]">{dep.version || '-'}</span>
-														</td>
-														<td class="px-4 py-2.5">
-															<Badge variant={strategyVariant(dep.strategy)} size="sm">{strategyLabel(dep.strategy)}</Badge>
-															<Show when={dep.strategy === 'canary' && dep.canary_weight > 0}>
-																<span class="text-xs text-[var(--color-text-tertiary)] ml-1">{dep.canary_weight}%</span>
+															<Show when={dep.version}>
+																<span class="text-sm font-mono text-[var(--color-text-primary)]">{dep.version}</span>
 															</Show>
-														</td>
-														<td class="px-4 py-2.5">
-															<span class="text-xs font-mono text-[var(--color-text-tertiary)]">{dep.commit_sha ? dep.commit_sha.substring(0, 7) : '-'}</span>
-														</td>
-														<td class="px-4 py-2.5">
-															<span class="text-sm text-[var(--color-text-secondary)]">{dep.deployed_by || '-'}</span>
-														</td>
-														<td class="px-4 py-2.5 text-right">
-															<span class="text-xs text-[var(--color-text-tertiary)]">{formatRelativeTime(dep.created_at)}</span>
-														</td>
-													</tr>
-												)}
-											</For>
-										</tbody>
-									</table>
+															<Badge variant={strategyVariant(dep.strategy)} size="sm">{strategyLabel(dep.strategy)}</Badge>
+															<Show when={dep.strategy === 'canary' && dep.canary_weight > 0 && dep.canary_weight < 100}>
+																<span class="text-xs text-amber-400">{dep.canary_weight}%</span>
+															</Show>
+														</div>
+														<span class="text-xs text-[var(--color-text-tertiary)] flex-shrink-0">{formatRelativeTime(dep.created_at)}</span>
+													</div>
+													<div class="flex items-center gap-3 mt-1 text-xs text-[var(--color-text-tertiary)]">
+														<Show when={dep.commit_sha}>
+															<span class="font-mono">{dep.commit_sha!.substring(0, 7)}</span>
+														</Show>
+														<Show when={dep.deployed_by}>
+															<span>by {dep.deployed_by}</span>
+														</Show>
+														<Show when={dep.image_tag}>
+															<span class="font-mono">{dep.image_tag}</span>
+														</Show>
+													</div>
+												</div>
+											</div>
+										)}
+									</For>
 								</div>
 							</Show>
 						</div>

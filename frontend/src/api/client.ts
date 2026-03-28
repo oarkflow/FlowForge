@@ -12,6 +12,10 @@ import type {
 	ScalingPolicy, ScalingEvent, ScalingMetrics,
 	PipelineLink, PipelineDAG,
 	InAppNotification, NotificationPreference, DashboardPreference, SearchResults,
+	ProjectDeploymentProvider, CreateDeploymentProviderRequest, UpdateDeploymentProviderRequest,
+	TestDeploymentProviderResponse,
+	ProjectEnvironmentChainEdge, UpdateEnvironmentChainRequest,
+	PipelineStageEnvironmentMapping, UpdateStageEnvironmentMappingRequest,
 } from '../types';
 
 const API_BASE = '/api/v1';
@@ -596,5 +600,69 @@ export const api = {
 
 	badges: {
 		pipelineUrl: (pipelineId: string) => `${API_BASE}/badges/pipeline/${pipelineId}`,
+	},
+
+	templates: {
+		list: (params?: Record<string, string>) => {
+			const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+			return apiClient.get<{ id: string; name: string; description: string; category: string; yaml: string; author: string; downloads: number; is_official: boolean }[]>(`/templates${qs}`);
+		},
+		get: (id: string) =>
+			apiClient.get<{ id: string; name: string; description: string; category: string; yaml: string; author: string; downloads: number; is_official: boolean }>(`/templates/${id}`),
+		create: (data: { name: string; description: string; category: string; yaml: string; tags?: string[] }) =>
+			apiClient.post<{ id: string }>('/templates', data),
+		delete: (id: string) =>
+			apiClient.delete<void>(`/templates/${id}`),
+	},
+
+	runMetrics: {
+		testResults: (projectId: string, pipelineId: string, runId: string) =>
+			apiClient.get<{ xml_content: string }>(`/projects/${projectId}/pipelines/${pipelineId}/runs/${runId}/test-results`),
+		coverage: (projectId: string, pipelineId: string, runId: string) =>
+			apiClient.get<{ total_percentage: number; total_lines: number; covered_lines: number; threshold: number; files: { file: string; lines: number; covered: number; percentage: number }[] }>(`/projects/${projectId}/pipelines/${pipelineId}/runs/${runId}/coverage`),
+		resources: (projectId: string, pipelineId: string, runId: string) =>
+			apiClient.get<{
+				points: { timestamp: number; cpu_percent: number; memory_mb: number; step_name: string }[];
+				steps: { step_name: string; step_id: string; avg_cpu: number; max_cpu: number; avg_memory: number; max_memory: number; duration_ms: number }[];
+			}>(`/projects/${projectId}/pipelines/${pipelineId}/runs/${runId}/resources`),
+	},
+
+	pipelineMetrics: {
+		healthTrend: (projectId: string, pipelineId: string, days?: number) =>
+			apiClient.get<{ date: string; success: number; failure: number; cancelled: number }[]>(
+				`/projects/${projectId}/pipelines/${pipelineId}/metrics/health?days=${days ?? 30}`
+			),
+	},
+
+	agentMetrics: {
+		utilization: () =>
+			apiClient.get<{ timestamp: string; cpu_percent: number; memory_percent: number; queue_depth: number }[]>('/agents/metrics/utilization'),
+	},
+
+	deploymentProviders: {
+		list: (projectId: string) =>
+			apiClient.get<ProjectDeploymentProvider[]>(`/projects/${projectId}/deployment-providers`),
+		create: (projectId: string, data: CreateDeploymentProviderRequest) =>
+			apiClient.post<ProjectDeploymentProvider>(`/projects/${projectId}/deployment-providers`, data),
+		update: (projectId: string, dpId: string, data: UpdateDeploymentProviderRequest) =>
+			apiClient.put<ProjectDeploymentProvider>(`/projects/${projectId}/deployment-providers/${dpId}`, data),
+		delete: (projectId: string, dpId: string) =>
+			apiClient.delete<{ message: string }>(`/projects/${projectId}/deployment-providers/${dpId}`),
+		test: (projectId: string, dpId: string) =>
+			apiClient.post<TestDeploymentProviderResponse>(`/projects/${projectId}/deployment-providers/${dpId}/test`),
+	},
+
+	environmentChain: {
+		get: (projectId: string) =>
+			apiClient.get<ProjectEnvironmentChainEdge[]>(`/projects/${projectId}/environment-chain`),
+		update: (projectId: string, edges: UpdateEnvironmentChainRequest[]) =>
+			apiClient.put<ProjectEnvironmentChainEdge[]>(`/projects/${projectId}/environment-chain`, edges),
+	},
+
+	stageEnvironments: {
+		get: (projectId: string, pipelineId: string) =>
+			apiClient.get<PipelineStageEnvironmentMapping[]>(`/projects/${projectId}/pipelines/${pipelineId}/stage-environments`),
+		update: (projectId: string, pipelineId: string, mappings: UpdateStageEnvironmentMappingRequest[]) =>
+			apiClient.put<PipelineStageEnvironmentMapping[]>(`/projects/${projectId}/pipelines/${pipelineId}/stage-environments`, mappings),
 	},
 };

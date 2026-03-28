@@ -1,0 +1,275 @@
+# ==============================================================================
+# Docker Deployment — Laravel PHP + Golang HTTP Server with Databases
+# Build both services, run them in Docker with MySQL (for Laravel) and
+# PostgreSQL (for Go), behind an Nginx reverse proxy.
+# ==============================================================================
+
+version: "1"
+name: "Docker Multi-Service — Laravel + Go"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+defaults:
+  executor: docker
+  image: docker:26-cli
+  timeout: 30m
+
+env:
+  COMPOSE_PROJECT: "myapp"
+  REGISTRY_URL: "${REGISTRY_URL}"
+  REGISTRY_USERNAME: "${REGISTRY_USERNAME}"
+  REGISTRY_PASSWORD: "${REGISTRY_PASSWORD}"
+  IMAGE_PREFIX: "${IMAGE_PREFIX:-myapp}"
+
+stages:
+  - test
+  - build-images
+  - push-images
+  - deploy
+  - post-deploy
+  - verify
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Stage 1: Run tests for both services
+  # --------------------------------------------------------------------------
+  test-laravel:
+    stage: test
+    executor: docker
+    image: php:8.3-cli
+    cache:
+      key: composer-{{ hash "laravel/composer.lock" }}
+      paths:
+        - laravel/vendor
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Install PHP dependencies
+        run: |
+          apt-get update && apt-get install -y unzip git libzip-dev libpq-dev
+          docker-php-ext-install zip pdo pdo_mysql
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          cd laravel && composer install --no-interaction --prefer-dist
+      - name: Run Laravel tests
+        run: |
+          cd laravel
+          cp .env.example .env
+          php artisan key:generate
+          php artisan test
+
+  test-golang:
+    stage: test
+    executor: docker
+    image: golang:1.22-alpine
+    cache:
+      key: go-mod-{{ hash "golang/go.sum" }}
+      paths:
+        - /go/pkg/mod
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run Go tests
+        run: |
+          cd golang
+          go mod download
+          go test -race -coverprofile=coverage.out ./...
+
+  # --------------------------------------------------------------------------
+  # Stage 2: Build Docker images for all services
+  # --------------------------------------------------------------------------
+  build-laravel-image:
+    stage: build-images
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Build Laravel Docker image
+        run: |
+          TAG=$(date +%Y%m%d%H%M%S)
+          docker build \
+            -t "${IMAGE_PREFIX}-laravel:latest" \
+            -t "${IMAGE_PREFIX}-laravel:${TAG}" \
+            -f laravel/Dockerfile \
+            laravel/
+          echo "IMAGE_TAG_LARAVEL=${TAG}" >> $FLOWFORGE_ENV
+          echo "Built: ${IMAGE_PREFIX}-laravel:${TAG}"
+
+  build-golang-image:
+    stage: build-images
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Build Go frontend
+        run: |
+          docker run --rm -v "$(pwd)/golang/frontend:/app" -w /app node:20-alpine sh -c "npm ci && npm run build"
+      - name: Build Golang Docker image
+        run: |
+          TAG=$(date +%Y%m%d%H%M%S)
+          docker build \
+            -t "${IMAGE_PREFIX}-golang:latest" \
+            -t "${IMAGE_PREFIX}-golang:${TAG}" \
+            -f golang/Dockerfile \
+            golang/
+          echo "IMAGE_TAG_GOLANG=${TAG}" >> $FLOWFORGE_ENV
+          echo "Built: ${IMAGE_PREFIX}-golang:${TAG}"
+
+  # --------------------------------------------------------------------------
+  # Stage 3: Push images to registry (optional — skip for local Docker deploy)
+  # --------------------------------------------------------------------------
+  push-images:
+    stage: push-images
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Login to registry
+        run: echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_URL" -u "$REGISTRY_USERNAME" --password-stdin
+      - name: Push Laravel image
+        run: |
+          docker tag "${IMAGE_PREFIX}-laravel:latest" "${REGISTRY_URL}/${IMAGE_PREFIX}-laravel:latest"
+          docker push "${REGISTRY_URL}/${IMAGE_PREFIX}-laravel:latest"
+      - name: Push Golang image
+        run: |
+          docker tag "${IMAGE_PREFIX}-golang:latest" "${REGISTRY_URL}/${IMAGE_PREFIX}-golang:latest"
+          docker push "${REGISTRY_URL}/${IMAGE_PREFIX}-golang:latest"
+
+  # --------------------------------------------------------------------------
+  # Stage 4: Deploy with docker-compose
+  # --------------------------------------------------------------------------
+  deploy:
+    stage: deploy
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Deploy with Docker Compose
+        run: |
+          # Install docker-compose
+          apk add --no-cache docker-compose || {
+            COMPOSE_VERSION="2.27.0"
+            wget -q "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64" -O /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+          }
+
+          echo "=== Deploying stack ==="
+
+          # Create required directories for persistent volumes
+          mkdir -p data/mysql data/postgres data/redis
+
+          # Create .env for docker-compose
+          cat > .env << 'EOF'
+          COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT}
+          MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-secret}
+          MYSQL_DATABASE=${LARAVEL_DB_DATABASE:-laravel}
+          MYSQL_USER=${LARAVEL_DB_USERNAME:-laravel}
+          MYSQL_PASSWORD=${LARAVEL_DB_PASSWORD:-secret}
+          POSTGRES_DB=${GOLANG_DB_DATABASE:-goapp}
+          POSTGRES_USER=${GOLANG_DB_USERNAME:-goapp}
+          POSTGRES_PASSWORD=${GOLANG_DB_PASSWORD:-secret}
+          REDIS_PASSWORD=${REDIS_PASSWORD:-secret}
+          EOF
+
+          # Pull latest images (if using registry) or use locally built ones
+          docker-compose -f docker-compose.yml pull 2>/dev/null || true
+
+          # Deploy the full stack
+          docker-compose -f docker-compose.yml up -d --remove-orphans
+
+          # Wait for databases to be ready
+          echo "Waiting for databases to be ready..."
+          sleep 15
+
+          echo "=== Stack deployed ==="
+          docker-compose ps
+
+  # --------------------------------------------------------------------------
+  # Stage 5: Post-deploy — run migrations for both services
+  # --------------------------------------------------------------------------
+  migrate-laravel:
+    stage: post-deploy
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run Laravel migrations
+        run: |
+          echo "=== Running Laravel migrations ==="
+          docker-compose exec -T laravel php artisan migrate --force
+          docker-compose exec -T laravel php artisan config:cache
+          docker-compose exec -T laravel php artisan route:cache
+          docker-compose exec -T laravel php artisan view:cache
+          echo "Laravel migrations complete"
+
+  migrate-golang:
+    stage: post-deploy
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Run Go migrations
+        run: |
+          echo "=== Running Golang database migrations ==="
+          docker-compose exec -T golang ./server migrate up
+          echo "Go migrations complete"
+
+  # --------------------------------------------------------------------------
+  # Stage 6: Verify all services are healthy
+  # --------------------------------------------------------------------------
+  verify:
+    stage: verify
+    executor: docker
+    image: docker:26-cli
+    privileged: true
+    steps:
+      - name: Checkout
+        uses: flowforge/checkout@v1
+      - name: Verify service health
+        run: |
+          echo "=== Service Status ==="
+          docker-compose ps
+
+          echo ""
+          echo "=== Health Checks ==="
+
+          # Check Laravel health
+          LARAVEL_STATUS=$(docker-compose exec -T laravel php artisan --version 2>&1 && echo "OK" || echo "FAIL")
+          echo "Laravel: ${LARAVEL_STATUS}"
+
+          # Check Go health
+          GO_STATUS=$(docker-compose exec -T golang wget -qO- http://localhost:8080/health 2>&1 || echo "FAIL")
+          echo "Golang:  ${GO_STATUS}"
+
+          # Check MySQL
+          MYSQL_STATUS=$(docker-compose exec -T mysql mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" 2>&1 | grep -o "alive" || echo "FAIL")
+          echo "MySQL:   ${MYSQL_STATUS}"
+
+          # Check PostgreSQL
+          PG_STATUS=$(docker-compose exec -T postgres pg_isready -U "${GOLANG_DB_USERNAME:-goapp}" 2>&1 | grep -o "accepting" || echo "FAIL")
+          echo "Postgres: ${PG_STATUS}"
+
+          # Check Redis
+          REDIS_STATUS=$(docker-compose exec -T redis redis-cli -a "${REDIS_PASSWORD:-secret}" ping 2>&1 | grep -o "PONG" || echo "FAIL")
+          echo "Redis:   ${REDIS_STATUS}"
+
+          echo ""
+          echo "=== Verification complete ==="
